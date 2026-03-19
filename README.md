@@ -20,13 +20,30 @@ If your machine restarts, tmux crashes, or you accidentally kill a pane — `com
 - Window exists but copilot stopped → resumes copilot in the existing pane
 - Everything already running → skips (no-op)
 
+## Prerequisites
+
+- **tmux** — `brew install tmux`
+- **uv** (Python package manager) — `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- **GitHub Copilot CLI** (`@github/copilot`) running in your tmux sessions
+
 ## Install
 
 ```bash
-# Install as a global tool
+# Install as a global CLI tool (recommended)
 uv tool install git+https://github.com/jakkaj/comax.git
+```
 
-# Or run directly without installing
+This puts `comax` on your PATH so you can run it from anywhere.
+
+To update to the latest version:
+
+```bash
+uv tool install git+https://github.com/jakkaj/comax.git --force
+```
+
+Or run it once without installing:
+
+```bash
 uvx --from git+https://github.com/jakkaj/comax.git comax
 ```
 
@@ -39,9 +56,3 @@ comax
 # Restore from saved state
 comax --restore
 ```
-
-## Requirements
-
-- Python 3.12+
-- tmux
-- GitHub Copilot CLI (`@github/copilot`)
