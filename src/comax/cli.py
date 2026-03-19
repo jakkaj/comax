@@ -1,15 +1,13 @@
-"""comax: Save and restore tmux + Copilot CLI sessions.
+"""comax: Save and restore tmux + Copilot CLI and Claude Code sessions.
 
 Usage:
   comax              # Scan, display, and save state
   comax --save       # Same as above
   comax --restore    # Restore sessions from saved state
 
-Discovery mechanism:
-  1. Walk tmux panes -> get shell PIDs
-  2. Walk each shell's process tree -> find copilot native binary PIDs
-  3. Glob ~/.copilot/session-state/*/inuse.<PID>.lock to match PID -> session UUID
-  4. Read workspace.yaml in the session dir for metadata (cwd, branch, summary, etc.)
+Discovery:
+  Copilot: process tree walk -> PID match against ~/.copilot/session-state/*/inuse.<PID>.lock
+  Claude:  child PID match against ~/.claude/sessions/<PID>.json
 """
 
 import argparse
@@ -28,6 +26,7 @@ from rich.panel import Panel
 
 
 COPILOT_STATE_DIR = Path.home() / ".copilot" / "session-state"
+CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 CONFIG_DIR = Path.home() / ".config" / "comax"
 STATE_FILE = CONFIG_DIR / "state.json"
 
@@ -48,24 +47,15 @@ class PaneInfo:
 
 
 @dataclass
-class SessionMetadata:
-    uuid: str
-    cwd: str | None = None
-    git_root: str | None = None
-    repository: str | None = None
-    branch: str | None = None
-    summary: str | None = None
-    created_at: str | None = None
-    updated_at: str | None = None
-
-
-@dataclass
-class CopilotInstance:
+class AgentInstance:
+    """A CLI agent (copilot or claude) running in a tmux pane."""
     pane: PaneInfo
-    copilot_pid: int
-    copilot_command: str
-    session: SessionMetadata | None = None
-    child_pids: list[int] = field(default_factory=list)
+    agent_type: str  # "copilot" or "claude"
+    agent_pid: int
+    agent_command: str
+    session_uuid: str | None = None
+    cwd: str | None = None
+    args: str = ""
 
 
 # ── Process / tmux helpers ────────────────────────────────────────────────────
@@ -102,11 +92,32 @@ def get_tmux_panes() -> list[PaneInfo]:
     return panes
 
 
+def pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def get_child_pids(pid: int) -> list[int]:
-    raw = run(["pgrep", "-P", str(pid)])
+    # Use ps instead of pgrep — pgrep on macOS can't find ancestor processes
+    raw = run(["ps", "-eo", "pid=,ppid="])
     if not raw:
         return []
-    return [int(p) for p in raw.splitlines() if p.strip()]
+    children = []
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            try:
+                child_pid, parent_pid = int(parts[0]), int(parts[1])
+                if parent_pid == pid:
+                    children.append(child_pid)
+            except ValueError:
+                continue
+    return children
 
 
 def get_process_command(pid: int) -> str:
@@ -123,16 +134,28 @@ def walk_process_tree(pid: int, depth: int = 0) -> list[tuple[int, str, int]]:
     return results
 
 
-def pane_has_copilot(pane_pid: int) -> bool:
-    tree = walk_process_tree(pane_pid)
-    return any("copilot" in cmd.lower() for _, cmd, _ in tree)
+def pane_has_agent(pane_pid: int, agent_type: str) -> bool:
+    """Check if a pane's process tree contains a given agent."""
+    if agent_type == "copilot":
+        tree = walk_process_tree(pane_pid)
+        return any("copilot" in cmd.lower() for _, cmd, _ in tree)
+    elif agent_type == "claude":
+        # Claude is a direct child of the shell, check children
+        for child_pid in get_child_pids(pane_pid):
+            cmd = get_process_command(child_pid)
+            if cmd:
+                binary = cmd.split()[0].split("/")[-1].lower()
+                if binary == "claude":
+                    return True
+        return False
+    return False
 
 
-# ── Lock file index ──────────────────────────────────────────────────────────
+# ── Copilot discovery ────────────────────────────────────────────────────────
 
 
-def build_lock_index() -> dict[int, str]:
-    """Build a map of PID -> session UUID from lock files on disk."""
+def build_copilot_lock_index() -> dict[int, str]:
+    """Build PID -> session UUID from ~/.copilot/session-state/*/inuse.*.lock."""
     index: dict[int, str] = {}
     pattern = str(COPILOT_STATE_DIR / "*" / "inuse.*.lock")
     for lock_path in glob(pattern):
@@ -141,70 +164,29 @@ def build_lock_index() -> dict[int, str]:
             pid = int(path.stem.split(".")[1])
         except (IndexError, ValueError):
             continue
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not pid_is_alive(pid):
             continue
-        except PermissionError:
-            pass
-        session_uuid = path.parent.name
-        index[pid] = session_uuid
+        index[pid] = path.parent.name
     return index
 
 
-def read_session_metadata(uuid: str) -> SessionMetadata | None:
+def read_copilot_metadata(uuid: str) -> tuple[str | None, str | None]:
+    """Read cwd and branch from workspace.yaml. Returns (cwd, branch)."""
     workspace_path = COPILOT_STATE_DIR / uuid / "workspace.yaml"
     if not workspace_path.exists():
-        return SessionMetadata(uuid=uuid)
+        return None, None
     try:
         with open(workspace_path) as f:
             data = yaml.safe_load(f)
         if not data:
-            return SessionMetadata(uuid=uuid)
-        return SessionMetadata(
-            uuid=data.get("id", uuid),
-            cwd=data.get("cwd"),
-            git_root=data.get("git_root"),
-            repository=data.get("repository"),
-            branch=data.get("branch"),
-            summary=data.get("summary"),
-            created_at=data.get("created_at"),
-            updated_at=data.get("updated_at"),
-        )
+            return None, None
+        return data.get("cwd"), data.get("branch")
     except Exception:
-        return SessionMetadata(uuid=uuid)
-
-
-# ── Discovery ────────────────────────────────────────────────────────────────
-
-
-def find_copilot_instances(panes: list[PaneInfo], lock_index: dict[int, str]) -> list[CopilotInstance]:
-    instances = []
-    for pane in panes:
-        tree = walk_process_tree(pane.pane_pid)
-        copilot_procs = [(pid, cmd, d) for pid, cmd, d in tree if "copilot" in cmd.lower()]
-        if not copilot_procs:
-            continue
-
-        main_pid, main_cmd, _ = copilot_procs[0]
-        instance = CopilotInstance(
-            pane=pane,
-            copilot_pid=main_pid,
-            copilot_command=main_cmd,
-            child_pids=[pid for pid, _, _ in copilot_procs[1:]],
-        )
-
-        for pid, _, _ in reversed(copilot_procs):
-            if pid in lock_index:
-                instance.session = read_session_metadata(lock_index[pid])
-                break
-
-        instances.append(instance)
-    return instances
+        return None, None
 
 
 def extract_copilot_args(command: str) -> str:
-    """Extract the copilot flags from the command line (minus --resume and its value)."""
+    """Extract copilot flags minus --resume and its value."""
     parts = command.split()
     args = []
     skip_next = False
@@ -222,6 +204,129 @@ def extract_copilot_args(command: str) -> str:
     return " ".join(args) if args else "--yolo"
 
 
+def find_copilot_in_pane(pane: PaneInfo, lock_index: dict[int, str]) -> AgentInstance | None:
+    tree = walk_process_tree(pane.pane_pid)
+    copilot_procs = [(pid, cmd, d) for pid, cmd, d in tree if "copilot" in cmd.lower()]
+    if not copilot_procs:
+        return None
+
+    main_pid, main_cmd, _ = copilot_procs[0]
+
+    # Match deepest copilot PID against lock index
+    session_uuid = None
+    for pid, _, _ in reversed(copilot_procs):
+        if pid in lock_index:
+            session_uuid = lock_index[pid]
+            break
+
+    cwd = None
+    if session_uuid:
+        cwd, _ = read_copilot_metadata(session_uuid)
+
+    return AgentInstance(
+        pane=pane,
+        agent_type="copilot",
+        agent_pid=main_pid,
+        agent_command=main_cmd,
+        session_uuid=session_uuid,
+        cwd=cwd,
+        args=extract_copilot_args(main_cmd),
+    )
+
+
+# ── Claude discovery ─────────────────────────────────────────────────────────
+
+
+def build_claude_session_index() -> dict[int, dict]:
+    """Build PID -> session data from ~/.claude/sessions/<PID>.json."""
+    index: dict[int, dict] = {}
+    if not CLAUDE_SESSIONS_DIR.exists():
+        return index
+    for f in CLAUDE_SESSIONS_DIR.glob("*.json"):
+        try:
+            pid = int(f.stem)
+        except ValueError:
+            continue
+        if not pid_is_alive(pid):
+            continue
+        try:
+            index[pid] = json.loads(f.read_text())
+        except Exception:
+            continue
+    return index
+
+
+def extract_claude_args(command: str) -> str:
+    """Extract claude flags minus --resume and its value."""
+    parts = command.split()
+    args = []
+    skip_next = False
+    for part in parts:
+        if skip_next:
+            skip_next = False
+            continue
+        if part == "--resume":
+            skip_next = True
+            continue
+        if part.startswith("--resume="):
+            continue
+        # Skip the binary name itself
+        binary = part.split("/")[-1].lower()
+        if binary == "claude":
+            continue
+        if part.startswith("--") or part.startswith("-"):
+            args.append(part)
+    return " ".join(args) if args else ""
+
+
+def find_claude_in_pane(pane: PaneInfo, claude_index: dict[int, dict]) -> AgentInstance | None:
+    # Check direct children of the pane shell
+    for child_pid in get_child_pids(pane.pane_pid):
+        cmd = get_process_command(child_pid)
+        if not cmd:
+            continue
+        binary = cmd.split()[0].split("/")[-1].lower()
+        if binary != "claude":
+            continue
+
+        # Found a claude process — look it up in the session index
+        data = claude_index.get(child_pid, {})
+        return AgentInstance(
+            pane=pane,
+            agent_type="claude",
+            agent_pid=child_pid,
+            agent_command=cmd,
+            session_uuid=data.get("sessionId"),
+            cwd=data.get("cwd"),
+            args=extract_claude_args(cmd),
+        )
+    return None
+
+
+# ── Unified discovery ─────────────────────────────────────────────────────────
+
+
+def discover_all(panes: list[PaneInfo]) -> list[AgentInstance]:
+    """Find all copilot and claude instances across tmux panes."""
+    copilot_lock_index = build_copilot_lock_index()
+    claude_session_index = build_claude_session_index()
+
+    instances = []
+    for pane in panes:
+        # Try copilot first
+        inst = find_copilot_in_pane(pane, copilot_lock_index)
+        if inst:
+            instances.append(inst)
+            continue
+
+        # Try claude
+        inst = find_claude_in_pane(pane, claude_session_index)
+        if inst:
+            instances.append(inst)
+
+    return instances
+
+
 # ── Save ──────────────────────────────────────────────────────────────────────
 
 
@@ -235,15 +340,14 @@ def cmd_save(console: Console):
 
     console.print(f"\nFound [bold]{len(panes)}[/bold] tmux panes across sessions.\n")
 
-    lock_index = build_lock_index()
-    instances = find_copilot_instances(panes, lock_index)
+    instances = discover_all(panes)
 
     if not instances:
-        console.print("[yellow]No Copilot CLI instances found in any tmux pane.[/yellow]")
+        console.print("[yellow]No Copilot or Claude instances found in any tmux pane.[/yellow]")
         return
 
-    # Group instances by tmux session
-    sessions_map: dict[str, list[CopilotInstance]] = {}
+    # Group by tmux session
+    sessions_map: dict[str, list[AgentInstance]] = {}
     for inst in instances:
         sessions_map.setdefault(inst.pane.session_name, []).append(inst)
 
@@ -256,12 +360,12 @@ def cmd_save(console: Console):
     for session_name, session_instances in sessions_map.items():
         windows = []
         for inst in session_instances:
-            cwd = inst.session.cwd if inst.session and inst.session.cwd else None
             windows.append({
                 "name": inst.pane.window_name,
-                "cwd": cwd,
-                "copilot_session_uuid": inst.session.uuid if inst.session else None,
-                "copilot_args": extract_copilot_args(inst.copilot_command),
+                "cwd": inst.cwd,
+                "agent_type": inst.agent_type,
+                "session_uuid": inst.session_uuid,
+                "args": inst.args,
             })
         state["sessions"].append({
             "name": session_name,
@@ -277,8 +381,9 @@ def cmd_save(console: Console):
     table = Table(title="Saved State", show_lines=True)
     table.add_column("Tmux Session", style="cyan")
     table.add_column("Window", style="green")
+    table.add_column("Agent", style="magenta")
     table.add_column("CWD", style="dim", max_width=50)
-    table.add_column("Copilot UUID", style="bold white", max_width=38)
+    table.add_column("Session UUID", style="bold white", max_width=38)
     table.add_column("Args", style="yellow")
 
     for session in state["sessions"]:
@@ -286,14 +391,23 @@ def cmd_save(console: Console):
             table.add_row(
                 session["name"],
                 win["name"],
+                win["agent_type"],
                 win["cwd"] or "-",
-                win["copilot_session_uuid"] or "-",
-                win["copilot_args"],
+                win["session_uuid"] or "-",
+                win["args"] or "-",
             )
 
     console.print(table)
     console.print(f"\n[green]State saved to {STATE_FILE}[/green]")
-    console.print(f"[dim]{len(instances)} copilot instance(s) across {len(sessions_map)} session(s)[/dim]")
+
+    copilot_count = sum(1 for inst in instances if inst.agent_type == "copilot")
+    claude_count = sum(1 for inst in instances if inst.agent_type == "claude")
+    parts = []
+    if copilot_count:
+        parts.append(f"{copilot_count} copilot")
+    if claude_count:
+        parts.append(f"{claude_count} claude")
+    console.print(f"[dim]{' + '.join(parts)} instance(s) across {len(sessions_map)} session(s)[/dim]")
 
 
 # ── Restore ───────────────────────────────────────────────────────────────────
@@ -322,6 +436,25 @@ def get_existing_windows(session_name: str) -> dict[str, int]:
     return result
 
 
+def build_resume_command(win: dict) -> str:
+    """Build the shell command to resume an agent in a pane."""
+    agent_type = win.get("agent_type", "copilot")
+    uuid = win.get("session_uuid")
+    args = win.get("args", "")
+    cwd = win.get("cwd")
+
+    if agent_type == "claude":
+        binary = "claude"
+        resume_cmd = f"{binary} {args} --resume {uuid}".strip() if uuid else f"{binary} {args}".strip()
+    else:
+        binary = "copilot"
+        resume_cmd = f"{binary} {args} --resume {uuid}".strip() if uuid else f"{binary} {args}".strip()
+
+    if cwd:
+        return f"cd {_shell_quote(cwd)} && {resume_cmd}"
+    return resume_cmd
+
+
 def cmd_restore(console: Console):
     console.print(Panel("[bold]comax restore[/bold]", style="blue"))
 
@@ -344,10 +477,10 @@ def cmd_restore(console: Console):
 
     existing_sessions = get_existing_tmux_sessions()
 
-    # Results table
     results = Table(title="Restore Results", show_lines=True)
     results.add_column("Session", style="cyan")
     results.add_column("Window", style="green")
+    results.add_column("Agent", style="magenta")
     results.add_column("Action", style="yellow")
     results.add_column("Status", style="bold")
 
@@ -361,65 +494,65 @@ def cmd_restore(console: Console):
 
         # Ensure session exists
         if session_name not in existing_sessions:
-            # Create session with first window
             first_win = windows[0]
             win_cwd = first_win.get("cwd") or first_cwd
+            agent_type = first_win.get("agent_type", "copilot")
             run(["tmux", "new-session", "-d", "-s", session_name,
                  "-n", first_win["name"], "-c", win_cwd])
 
-            # Resume copilot in the first window
-            uuid = first_win.get("copilot_session_uuid")
-            args = first_win.get("copilot_args", "--yolo")
+            uuid = first_win.get("session_uuid")
             if uuid:
-                copilot_cmd = f"cd {_shell_quote(win_cwd)} && copilot {args} --resume {uuid}"
-                run(["tmux", "send-keys", "-t", f"{session_name}:{first_win['name']}", copilot_cmd, "Enter"])
-                results.add_row(session_name, first_win["name"], "created session + window + resumed copilot", "[green]OK[/green]")
+                resume_cmd = build_resume_command(first_win)
+                run(["tmux", "send-keys", "-t", f"{session_name}:{first_win['name']}", resume_cmd, "Enter"])
+                results.add_row(session_name, first_win["name"], agent_type,
+                                "created session + window + resumed", "[green]OK[/green]")
             else:
-                results.add_row(session_name, first_win["name"], "created session + window (no UUID)", "[yellow]WARN[/yellow]")
+                results.add_row(session_name, first_win["name"], agent_type,
+                                "created session + window (no UUID)", "[yellow]WARN[/yellow]")
 
             existing_sessions.add(session_name)
             remaining_windows = windows[1:]
         else:
             remaining_windows = windows
 
-        # Get current windows in this session
         existing_windows = get_existing_windows(session_name)
 
         for win in remaining_windows:
             win_name = win["name"]
             win_cwd = win.get("cwd") or first_cwd
-            uuid = win.get("copilot_session_uuid")
-            args = win.get("copilot_args", "--yolo")
+            uuid = win.get("session_uuid")
+            agent_type = win.get("agent_type", "copilot")
 
             if win_name in existing_windows:
-                # Window exists — check if copilot is running
                 pane_pid = existing_windows[win_name]
-                if pane_has_copilot(pane_pid):
-                    results.add_row(session_name, win_name, "copilot already running", "[green]SKIP[/green]")
+                if pane_has_agent(pane_pid, agent_type):
+                    results.add_row(session_name, win_name, agent_type,
+                                    f"{agent_type} already running", "[green]SKIP[/green]")
                 else:
-                    # Window exists but copilot not running — resume
                     if uuid:
-                        copilot_cmd = f"cd {_shell_quote(win_cwd)} && copilot {args} --resume {uuid}"
-                        run(["tmux", "send-keys", "-t", f"{session_name}:{win_name}", copilot_cmd, "Enter"])
-                        results.add_row(session_name, win_name, "resumed copilot in existing window", "[green]OK[/green]")
+                        resume_cmd = build_resume_command(win)
+                        run(["tmux", "send-keys", "-t", f"{session_name}:{win_name}", resume_cmd, "Enter"])
+                        results.add_row(session_name, win_name, agent_type,
+                                        f"resumed {agent_type} in existing window", "[green]OK[/green]")
                     else:
-                        results.add_row(session_name, win_name, "window exists but no UUID to resume", "[yellow]WARN[/yellow]")
+                        results.add_row(session_name, win_name, agent_type,
+                                        "window exists but no UUID to resume", "[yellow]WARN[/yellow]")
             else:
-                # Window missing — create it and resume copilot
                 run(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
                 if uuid:
-                    copilot_cmd = f"cd {_shell_quote(win_cwd)} && copilot {args} --resume {uuid}"
-                    run(["tmux", "send-keys", "-t", f"{session_name}:{win_name}", copilot_cmd, "Enter"])
-                    results.add_row(session_name, win_name, "created window + resumed copilot", "[green]OK[/green]")
+                    resume_cmd = build_resume_command(win)
+                    run(["tmux", "send-keys", "-t", f"{session_name}:{win_name}", resume_cmd, "Enter"])
+                    results.add_row(session_name, win_name, agent_type,
+                                    f"created window + resumed {agent_type}", "[green]OK[/green]")
                 else:
-                    results.add_row(session_name, win_name, "created window (no UUID)", "[yellow]WARN[/yellow]")
+                    results.add_row(session_name, win_name, agent_type,
+                                    "created window (no UUID)", "[yellow]WARN[/yellow]")
 
     console.print(results)
     console.print("\n[green]Restore complete.[/green]")
 
 
 def _shell_quote(s: str) -> str:
-    """Simple shell quoting for paths."""
     if " " in s or "'" in s or '"' in s:
         return "'" + s.replace("'", "'\\''") + "'"
     return s
@@ -429,7 +562,7 @@ def _shell_quote(s: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="comax: save/restore tmux + Copilot CLI sessions")
+    parser = argparse.ArgumentParser(description="comax: save/restore tmux + Copilot CLI and Claude Code sessions")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--save", action="store_true", default=True, help="Scan and save state (default)")
     group.add_argument("--restore", action="store_true", help="Restore sessions from saved state")
