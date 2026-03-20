@@ -420,19 +420,19 @@ def get_existing_tmux_sessions() -> set[str]:
     return set(raw.splitlines())
 
 
-def get_existing_windows(session_name: str) -> dict[str, int]:
-    """Return {window_name: pane_pid} for a session."""
+def get_existing_windows(session_name: str) -> list[tuple[str, int]]:
+    """Return [(window_name, pane_pid), ...] for a session. Preserves duplicates."""
     raw = run([
         "tmux", "list-windows", "-t", session_name,
         "-F", "#{window_name}|#{pane_pid}"
     ])
     if not raw:
-        return {}
-    result = {}
+        return []
+    result = []
     for line in raw.splitlines():
         parts = line.split("|", 1)
         if len(parts) == 2:
-            result[parts[0]] = int(parts[1])
+            result.append((parts[0], int(parts[1])))
     return result
 
 
@@ -503,6 +503,7 @@ def cmd_restore(console: Console):
             uuid = first_win.get("session_uuid")
             if uuid:
                 resume_cmd = build_resume_command(first_win)
+                # First window in a new session — no ambiguity, target by name is fine
                 run(["tmux", "send-keys", "-t", f"{session_name}:{first_win['name']}", resume_cmd, "Enter"])
                 results.add_row(session_name, first_win["name"], agent_type,
                                 "created session + window + resumed", "[green]OK[/green]")
@@ -516,6 +517,8 @@ def cmd_restore(console: Console):
             remaining_windows = windows
 
         existing_windows = get_existing_windows(session_name)
+        # Track which existing windows have been claimed (by list index)
+        claimed: set[int] = set()
 
         for win in remaining_windows:
             win_name = win["name"]
@@ -523,33 +526,79 @@ def cmd_restore(console: Console):
             uuid = win.get("session_uuid")
             agent_type = win.get("agent_type", "copilot")
 
-            if win_name in existing_windows:
-                pane_pid = existing_windows[win_name]
-                if pane_has_agent(pane_pid, agent_type):
+            # Find an unclaimed existing window with this name
+            matched_idx = None
+            matched_pane_pid = None
+            for idx, (name, pane_pid) in enumerate(existing_windows):
+                if name == win_name and idx not in claimed:
+                    matched_idx = idx
+                    matched_pane_pid = pane_pid
+                    break
+
+            if matched_idx is not None:
+                claimed.add(matched_idx)
+                if pane_has_agent(matched_pane_pid, agent_type):
                     results.add_row(session_name, win_name, agent_type,
                                     f"{agent_type} already running", "[green]SKIP[/green]")
                 else:
                     if uuid:
                         resume_cmd = build_resume_command(win)
-                        run(["tmux", "send-keys", "-t", f"{session_name}:{win_name}", resume_cmd, "Enter"])
+                        # Target by pane PID to avoid ambiguity with duplicate names
+                        _send_keys_to_pane(session_name, matched_pane_pid, resume_cmd)
                         results.add_row(session_name, win_name, agent_type,
                                         f"resumed {agent_type} in existing window", "[green]OK[/green]")
                     else:
                         results.add_row(session_name, win_name, agent_type,
                                         "window exists but no UUID to resume", "[yellow]WARN[/yellow]")
             else:
+                # No unclaimed window with this name — create a new one
                 run(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
                 if uuid:
                     resume_cmd = build_resume_command(win)
-                    run(["tmux", "send-keys", "-t", f"{session_name}:{win_name}", resume_cmd, "Enter"])
+                    # Target the newly created window by finding its pane PID
+                    refreshed = get_existing_windows(session_name)
+                    # The new window is the one not in our previous list
+                    old_pids = {pid for _, pid in existing_windows}
+                    new_pane_pid = None
+                    for name, pid in refreshed:
+                        if name == win_name and pid not in old_pids:
+                            new_pane_pid = pid
+                            break
+                    if new_pane_pid:
+                        _send_keys_to_pane(session_name, new_pane_pid, resume_cmd)
+                    else:
+                        # Fallback: target by name (works if no duplicates exist yet)
+                        run(["tmux", "send-keys", "-t", f"{session_name}:{win_name}", resume_cmd, "Enter"])
                     results.add_row(session_name, win_name, agent_type,
                                     f"created window + resumed {agent_type}", "[green]OK[/green]")
+                    # Refresh so subsequent iterations see the new window
+                    existing_windows = get_existing_windows(session_name)
                 else:
                     results.add_row(session_name, win_name, agent_type,
                                     "created window (no UUID)", "[yellow]WARN[/yellow]")
 
     console.print(results)
     console.print("\n[green]Restore complete.[/green]")
+
+
+def _send_keys_to_pane(session_name: str, pane_pid: int, keys: str):
+    """Send keys to a specific pane identified by its PID, avoiding name ambiguity."""
+    # Find the pane's tmux target by matching the PID
+    raw = run([
+        "tmux", "list-panes", "-t", session_name, "-a",
+        "-F", "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}"
+    ])
+    target = None
+    for line in (raw or "").splitlines():
+        parts = line.split("|", 1)
+        if len(parts) == 2 and parts[1].strip() == str(pane_pid):
+            target = parts[0]
+            break
+    if target:
+        run(["tmux", "send-keys", "-t", target, keys, "Enter"])
+    else:
+        # Fallback
+        run(["tmux", "send-keys", "-t", session_name, keys, "Enter"])
 
 
 def _shell_quote(s: str) -> str:
