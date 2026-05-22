@@ -1,4 +1,4 @@
-"""comax: Save and restore tmux + Copilot CLI and Claude Code sessions.
+"""comax: Save and restore tmux + Copilot CLI, Claude Code, and pi sessions.
 
 Usage:
   comax              # Scan, display, and save state
@@ -8,6 +8,7 @@ Usage:
 Discovery:
   Copilot: process tree walk -> PID match against ~/.copilot/session-state/*/inuse.<PID>.lock
   Claude:  child PID match against ~/.claude/sessions/<PID>.json
+  pi:      child PID with basename 'pi' -> lsof for cwd and open session-sql/<uuid>.sqlite
 """
 
 import argparse
@@ -27,6 +28,7 @@ from rich.panel import Panel
 
 COPILOT_STATE_DIR = Path.home() / ".copilot" / "session-state"
 CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+PI_DB_DIR = Path.home() / ".pi" / "db" / "session-sql"
 CONFIG_DIR = Path.home() / ".config" / "comax"
 STATE_FILE = CONFIG_DIR / "state.json"
 
@@ -48,9 +50,9 @@ class PaneInfo:
 
 @dataclass
 class AgentInstance:
-    """A CLI agent (copilot or claude) running in a tmux pane."""
+    """A CLI agent (copilot, claude, or pi) running in a tmux pane."""
     pane: PaneInfo
-    agent_type: str  # "copilot" or "claude"
+    agent_type: str  # "copilot", "claude", or "pi"
     agent_pid: int
     agent_command: str
     session_uuid: str | None = None
@@ -123,6 +125,23 @@ def get_child_pids(pid: int) -> list[int]:
 def get_process_command(pid: int) -> str:
     return run(["ps", "-o", "command=", "-p", str(pid)])
 
+def get_process_cwd(pid: int) -> str | None:
+    """Get the working directory of a process via lsof."""
+    raw = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+    if not raw:
+        return None
+    for line in raw.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return None
+
+def get_open_file_paths(pid: int) -> list[str]:
+    """Get the list of open file paths for a process via lsof."""
+    raw = run(["lsof", "-p", str(pid), "-Fn"])
+    if not raw:
+        return []
+    return [line[1:] for line in raw.splitlines() if line.startswith("n")]
+
 
 def walk_process_tree(pid: int, depth: int = 0) -> list[tuple[int, str, int]]:
     results = []
@@ -139,13 +158,14 @@ def pane_has_agent(pane_pid: int, agent_type: str) -> bool:
     if agent_type == "copilot":
         tree = walk_process_tree(pane_pid)
         return any("copilot" in cmd.lower() for _, cmd, _ in tree)
-    elif agent_type == "claude":
-        # Claude is a direct child of the shell, check children
+    elif agent_type in ("claude", "pi"):
+        # Direct child of the shell; match by binary basename to avoid false positives
+        # (e.g. 'python' contains 'pi', 'copilot' contains 'pi').
         for child_pid in get_child_pids(pane_pid):
             cmd = get_process_command(child_pid)
             if cmd:
                 binary = cmd.split()[0].split("/")[-1].lower()
-                if binary == "claude":
+                if binary == agent_type:
                     return True
         return False
     return False
@@ -303,6 +323,44 @@ def find_claude_in_pane(pane: PaneInfo, claude_index: dict[int, dict]) -> AgentI
     return None
 
 
+# ── pi discovery ──────────────────────────────────────────────────────────────
+
+def find_pi_session_uuid(pid: int) -> str | None:
+    """Look at a pi process's open files and pull the session UUID from
+    ~/.pi/db/session-sql/<uuid>.sqlite, which pi keeps open for the duration
+    of a session."""
+    db_prefix = str(PI_DB_DIR) + "/"
+    for path in get_open_file_paths(pid):
+        if path.startswith(db_prefix) and path.endswith(".sqlite"):
+            return Path(path).stem
+    return None
+
+def find_pi_in_pane(pane: PaneInfo) -> AgentInstance | None:
+    """Find a pi agent running as a direct child of the pane shell.
+
+    pi rewrites argv[0] to just 'pi', so we cannot recover the original
+    launch flags (model, thinking level, extensions, etc.). We capture cwd
+    and session UUID — enough to resume the conversation in place.
+    """
+    for child_pid in get_child_pids(pane.pane_pid):
+        cmd = get_process_command(child_pid)
+        if not cmd:
+            continue
+        binary = cmd.split()[0].split("/")[-1].lower()
+        if binary != "pi":
+            continue
+
+        return AgentInstance(
+            pane=pane,
+            agent_type="pi",
+            agent_pid=child_pid,
+            agent_command=cmd,
+            session_uuid=find_pi_session_uuid(child_pid),
+            cwd=get_process_cwd(child_pid),
+            args="",
+        )
+    return None
+
 # ── Unified discovery ─────────────────────────────────────────────────────────
 
 
@@ -321,6 +379,12 @@ def discover_all(panes: list[PaneInfo]) -> list[AgentInstance]:
 
         # Try claude
         inst = find_claude_in_pane(pane, claude_session_index)
+        if inst:
+            instances.append(inst)
+            continue
+
+        # Try pi
+        inst = find_pi_in_pane(pane)
         if inst:
             instances.append(inst)
 
@@ -402,11 +466,14 @@ def cmd_save(console: Console):
 
     copilot_count = sum(1 for inst in instances if inst.agent_type == "copilot")
     claude_count = sum(1 for inst in instances if inst.agent_type == "claude")
+    pi_count = sum(1 for inst in instances if inst.agent_type == "pi")
     parts = []
     if copilot_count:
         parts.append(f"{copilot_count} copilot")
     if claude_count:
         parts.append(f"{claude_count} claude")
+    if pi_count:
+        parts.append(f"{pi_count} pi")
     console.print(f"[dim]{' + '.join(parts)} instance(s) across {len(sessions_map)} session(s)[/dim]")
 
 
@@ -446,6 +513,11 @@ def build_resume_command(win: dict) -> str:
     if agent_type == "claude":
         binary = "claude"
         resume_cmd = f"{binary} {args} --resume {uuid}".strip() if uuid else f"{binary} {args}".strip()
+    elif agent_type == "pi":
+        binary = "pi"
+        # pi uses --session <uuid|partial-uuid> for non-interactive resume.
+        # --resume on pi is an interactive picker, so we deliberately avoid it.
+        resume_cmd = f"{binary} {args} --session {uuid}".strip() if uuid else f"{binary} {args}".strip()
     else:
         binary = "copilot"
         resume_cmd = f"{binary} {args} --resume {uuid}".strip() if uuid else f"{binary} {args}".strip()
@@ -611,7 +683,7 @@ def _shell_quote(s: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="comax: save/restore tmux + Copilot CLI and Claude Code sessions")
+    parser = argparse.ArgumentParser(description="comax: save/restore tmux + Copilot CLI, Claude Code, and pi sessions")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--save", action="store_true", default=True, help="Scan and save state (default)")
     group.add_argument("--restore", action="store_true", help="Restore sessions from saved state")

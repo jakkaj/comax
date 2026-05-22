@@ -1,8 +1,8 @@
 # comax
 
-Save and restore tmux sessions running Copilot CLI and Claude Code.
+Save and restore tmux sessions running Copilot CLI, Claude Code, and pi.
 
-If your machine restarts, tmux crashes, or you accidentally kill a pane — `comax` gets you back to exactly where you were. It discovers all running Copilot CLI and Claude Code instances across your tmux sessions, saves their state, and can rehydrate everything with a single command.
+If your machine restarts, tmux crashes, or you accidentally kill a pane — `comax` gets you back to exactly where you were. It discovers all running Copilot CLI, Claude Code, and pi instances across your tmux sessions, saves their state, and can rehydrate everything with a single command.
 
 ## How it works
 
@@ -10,8 +10,11 @@ If your machine restarts, tmux crashes, or you accidentally kill a pane — `com
 
 - **Copilot CLI**: walks each pane's process tree, matches PIDs to `~/.copilot/session-state/*/inuse.<PID>.lock` files
 - **Claude Code**: matches child PIDs to `~/.claude/sessions/<PID>.json` files
+- **pi**: matches direct-child PIDs named `pi`, then uses `lsof` to read the open `~/.pi/db/session-sql/<uuid>.sqlite` handle for the session UUID and the process cwd
 
-Both are saved to `~/.config/comax/state.json` with session UUIDs, working directories, and CLI flags.
+All three are saved to `~/.config/comax/state.json` with session UUIDs, working directories, and CLI flags.
+
+> **Note on pi flags**: pi rewrites `argv[0]` to just `"pi"`, so launch flags (model, thinking level, extensions, etc.) cannot be recovered. pi sessions are restored with `pi --session <uuid>` from the saved cwd, which resumes the conversation but uses pi's default configuration.
 
 **Restore** reads the saved state and intelligently rehydrates:
 
@@ -20,13 +23,13 @@ Both are saved to `~/.config/comax/state.json` with session UUIDs, working direc
 - Window exists but agent stopped → resumes in the existing pane
 - Everything already running → skips (no-op)
 
-Each agent is resumed with the correct command (`copilot --yolo --resume <uuid>` or `claude --resume <uuid>`) from the right working directory.
+Each agent is resumed with the correct command (`copilot --yolo --resume <uuid>`, `claude --resume <uuid>`, or `pi --session <uuid>`) from the right working directory.
 
 ## Prerequisites
 
 - **tmux** — `brew install tmux`
 - **uv** (Python package manager) — `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- **GitHub Copilot CLI** (`@github/copilot`) and/or **Claude Code** running in your tmux sessions
+- **GitHub Copilot CLI** (`@github/copilot`), **Claude Code**, and/or **pi** (`@earendil-works/pi-coding-agent`) running in your tmux sessions
 
 ## Install
 
