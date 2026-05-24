@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import subprocess
+import time
 from datetime import datetime, timezone
 from glob import glob
 from pathlib import Path
@@ -589,6 +590,27 @@ def is_session_alive(agent_type: str, uuid: str) -> bool:
         return False
     return False
 
+# Modest pause after creating a new tmux pane before sending keys. Modern
+# tmux (3.x) buffers send-keys to the pty so a slow shell still receives
+# everything; we validated this experimentally with a 600 ms sleep in
+# .zshrc and saw zero character loss. The sleep below is a defensive
+# margin for pathological cases (network homes, multi-KB rc files that
+# could exceed tmux's pty buffer). Tunable but never longer than needed.
+NEW_PANE_SETTLE_S = 0.05
+
+
+def _settle_new_pane() -> None:
+    """Brief defensive pause after creating a new tmux pane (FX001-5).
+
+    Validation showed tmux 3.x buffers send-keys reliably even with a 600 ms
+    slow .zshrc, so this is paranoia rather than necessity. Keeping it at
+    NEW_PANE_SETTLE_S (50 ms) is well below human-perceptible latency and
+    defends against pathological cases (network-mounted homes, multi-KB rc
+    files that could approach the pty buffer ceiling).
+    """
+    time.sleep(NEW_PANE_SETTLE_S)
+
+
 def build_resume_command(win: dict) -> str:
     """Build the shell command to resume an agent in a pane."""
     agent_type = win.get("agent_type", "copilot")
@@ -681,6 +703,7 @@ def cmd_restore(console: Console):
                     results.add_row(session_name, first_win["name"], agent_type,
                                     "new window not visible after create", "[red]FAIL[/red]")
                 else:
+                    _settle_new_pane()
                     sk = _send_keys_to_pane(session_name, first_pid, resume_cmd)
                     if sk.ok:
                         results.add_row(session_name, first_win["name"], agent_type,
@@ -768,6 +791,7 @@ def cmd_restore(console: Console):
                         results.add_row(session_name, win_name, agent_type,
                                         "new window not visible after create", "[red]FAIL[/red]")
                     else:
+                        _settle_new_pane()
                         sk = _send_keys_to_pane(session_name, new_pane_pid, resume_cmd)
                         if sk.ok:
                             results.add_row(session_name, win_name, agent_type,
