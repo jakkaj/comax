@@ -28,7 +28,9 @@ from rich.panel import Panel
 
 COPILOT_STATE_DIR = Path.home() / ".copilot" / "session-state"
 CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 PI_DB_DIR = Path.home() / ".pi" / "db" / "session-sql"
+PI_SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
 CONFIG_DIR = Path.home() / ".config" / "comax"
 STATE_FILE = CONFIG_DIR / "state.json"
 
@@ -560,6 +562,33 @@ def get_existing_windows(session_name: str) -> list[tuple[str, int]]:
     return result
 
 
+def is_session_alive(agent_type: str, uuid: str) -> bool:
+    """Check whether the agent's on-disk session store still has this UUID.
+
+    Agents rotate / garbage-collect session files (claude in particular
+    drops sessions that haven't been touched recently). A `--resume <uuid>`
+    against a missing session produces a broken pane that just prints an
+    error — the operator sees no agent. Pre-validate before sending keys
+    so we can emit a `WARN: uuid stale` row instead (FX001-4).
+    """
+    if not uuid:
+        return False
+    if agent_type == "copilot":
+        return (COPILOT_STATE_DIR / uuid).is_dir()
+    if agent_type == "claude":
+        # ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
+        return bool(list(CLAUDE_PROJECTS_DIR.glob(f"*/{uuid}.jsonl"))) if CLAUDE_PROJECTS_DIR.exists() else False
+    if agent_type == "pi":
+        # ~/.pi/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl
+        # Search the encoded-cwd dirs for any file whose stem ends with the uuid.
+        if not PI_SESSIONS_DIR.exists():
+            return False
+        for f in PI_SESSIONS_DIR.glob(f"*/*{uuid}*.jsonl"):
+            if f.is_file():
+                return True
+        return False
+    return False
+
 def build_resume_command(win: dict) -> str:
     """Build the shell command to resume an agent in a pane."""
     agent_type = win.get("agent_type", "copilot")
@@ -635,7 +664,11 @@ def cmd_restore(console: Console):
                 continue
 
             uuid = first_win.get("session_uuid")
-            if uuid:
+            if uuid and not is_session_alive(agent_type, uuid):
+                results.add_row(session_name, first_win["name"], agent_type,
+                                f"window created; uuid stale ({uuid[:8]}\u2026), agent not resumed",
+                                "[yellow]WARN[/yellow]")
+            elif uuid:
                 resume_cmd = build_resume_command(first_win)
                 # Look up the freshly-created pane by PID so we can send-keys
                 # via an unambiguous `<session>:<window_idx>.<pane_idx>` target.
@@ -689,7 +722,11 @@ def cmd_restore(console: Console):
                     results.add_row(session_name, win_name, agent_type,
                                     f"{agent_type} already running", "[green]SKIP[/green]")
                 else:
-                    if uuid:
+                    if uuid and not is_session_alive(agent_type, uuid):
+                        results.add_row(session_name, win_name, agent_type,
+                                        f"window exists; uuid stale ({uuid[:8]}\u2026), agent not resumed",
+                                        "[yellow]WARN[/yellow]")
+                    elif uuid:
                         resume_cmd = build_resume_command(win)
                         # Target by pane PID to avoid ambiguity with duplicate names
                         sk = _send_keys_to_pane(session_name, matched_pane_pid, resume_cmd)
@@ -708,6 +745,13 @@ def cmd_restore(console: Console):
                 if not nw.ok:
                     results.add_row(session_name, win_name, agent_type,
                                     f"new-window failed: {nw.reason}", "[red]FAIL[/red]")
+                    continue
+                if uuid and not is_session_alive(agent_type, uuid):
+                    results.add_row(session_name, win_name, agent_type,
+                                    f"window created; uuid stale ({uuid[:8]}\u2026), agent not resumed",
+                                    "[yellow]WARN[/yellow]")
+                    # Refresh so subsequent iterations see the new window
+                    existing_windows = get_existing_windows(session_name)
                     continue
                 if uuid:
                     resume_cmd = build_resume_command(win)
