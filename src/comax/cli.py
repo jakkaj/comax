@@ -125,6 +125,28 @@ def get_child_pids(pid: int) -> list[int]:
 def get_process_command(pid: int) -> str:
     return run(["ps", "-o", "command=", "-p", str(pid)])
 
+def _is_copilot_process(cmd: str) -> bool:
+    """True iff the command line represents a copilot agent process.
+
+    Matches:
+      * `copilot ...` and `/abs/path/to/copilot ...`
+      * `node /abs/path/to/copilot ...` (the npm wrapper invocation pattern)
+
+    Rejects anything where 'copilot' merely appears as a substring of an
+    argument (e.g. `lean-ctx -c 'build_copilot_lock_index'`, `gh copilot ...`,
+    `grep copilot`). Restricting to argv[0]/argv[1] basenames removes those
+    false positives without losing the real npm-wrapper detection.
+    """
+    toks = cmd.split()
+    if not toks:
+        return False
+    argv0 = toks[0].split("/")[-1].lower()
+    if argv0 == "copilot":
+        return True
+    if argv0 == "node" and len(toks) >= 2:
+        return toks[1].split("/")[-1].lower() == "copilot"
+    return False
+
 def get_process_cwd(pid: int) -> str | None:
     """Get the working directory of a process via lsof."""
     raw = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
@@ -157,7 +179,7 @@ def pane_has_agent(pane_pid: int, agent_type: str) -> bool:
     """Check if a pane's process tree contains a given agent."""
     if agent_type == "copilot":
         tree = walk_process_tree(pane_pid)
-        return any("copilot" in cmd.lower() for _, cmd, _ in tree)
+        return any(_is_copilot_process(cmd) for _, cmd, _ in tree)
     elif agent_type in ("claude", "pi"):
         # Direct child of the shell; match by binary basename to avoid false positives
         # (e.g. 'python' contains 'pi', 'copilot' contains 'pi').
@@ -226,7 +248,7 @@ def extract_copilot_args(command: str) -> str:
 
 def find_copilot_in_pane(pane: PaneInfo, lock_index: dict[int, str]) -> AgentInstance | None:
     tree = walk_process_tree(pane.pane_pid)
-    copilot_procs = [(pid, cmd, d) for pid, cmd, d in tree if "copilot" in cmd.lower()]
+    copilot_procs = [(pid, cmd, d) for pid, cmd, d in tree if _is_copilot_process(cmd)]
     if not copilot_procs:
         return None
 
