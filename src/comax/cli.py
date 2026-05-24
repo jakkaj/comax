@@ -64,8 +64,43 @@ class AgentInstance:
 
 
 def run(cmd: list[str]) -> str:
+    return run_full(cmd).stdout
+
+@dataclass
+class RunResult:
+    """Structured result of an external subprocess call.
+
+    The bare `run()` helper returns just stdout for the discovery path —
+    where empty output already signals 'no match'. For tmux mutations
+    (`new-session`, `new-window`, `send-keys`) we need the returncode and
+    stderr to tell the operator the truth: if the call failed, the restore
+    table must say `FAIL: <reason>`, not `OK`. Use `run_full()` in those
+    callsites.
+    """
+    stdout: str
+    stderr: str
+    returncode: int
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+    @property
+    def reason(self) -> str:
+        """Short failure reason (first non-empty line of stderr)."""
+        for line in self.stderr.splitlines():
+            line = line.strip()
+            if line:
+                return line
+        return f"exit {self.returncode}"
+
+def run_full(cmd: list[str]) -> RunResult:
     result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.stdout.strip()
+    return RunResult(
+        stdout=result.stdout.strip(),
+        stderr=result.stderr.strip(),
+        returncode=result.returncode,
+    )
 
 
 def get_tmux_panes() -> list[PaneInfo]:
@@ -591,16 +626,35 @@ def cmd_restore(console: Console):
             first_win = windows[0]
             win_cwd = first_win.get("cwd") or first_cwd
             agent_type = first_win.get("agent_type", "copilot")
-            run(["tmux", "new-session", "-d", "-s", session_name,
-                 "-n", first_win["name"], "-c", win_cwd])
+            new_sess = run_full(["tmux", "new-session", "-d", "-s", session_name,
+                                  "-n", first_win["name"], "-c", win_cwd])
+            if not new_sess.ok:
+                results.add_row(session_name, first_win["name"], agent_type,
+                                f"new-session failed: {new_sess.reason}", "[red]FAIL[/red]")
+                # Skip the rest of this tmux session — nothing else will work.
+                continue
 
             uuid = first_win.get("session_uuid")
             if uuid:
                 resume_cmd = build_resume_command(first_win)
-                # First window in a new session — no ambiguity, target by name is fine
-                run(["tmux", "send-keys", "-t", f"{session_name}:{first_win['name']}", resume_cmd, "Enter"])
-                results.add_row(session_name, first_win["name"], agent_type,
-                                "created session + window + resumed", "[green]OK[/green]")
+                # Look up the freshly-created pane by PID so we can send-keys
+                # via an unambiguous `<session>:<window_idx>.<pane_idx>` target.
+                # Name-based targeting (`<session>:<window_name>`) breaks when
+                # the window name contains a '.' — tmux mis-parses it as a
+                # window/pane index expression (see FX001-3).
+                fresh = get_existing_windows(session_name)
+                first_pid = next((pid for n, pid in fresh if n == first_win["name"]), None)
+                if first_pid is None:
+                    results.add_row(session_name, first_win["name"], agent_type,
+                                    "new window not visible after create", "[red]FAIL[/red]")
+                else:
+                    sk = _send_keys_to_pane(session_name, first_pid, resume_cmd)
+                    if sk.ok:
+                        results.add_row(session_name, first_win["name"], agent_type,
+                                        "created session + window + resumed", "[green]OK[/green]")
+                    else:
+                        results.add_row(session_name, first_win["name"], agent_type,
+                                        f"send-keys failed: {sk.reason}", "[red]FAIL[/red]")
             else:
                 results.add_row(session_name, first_win["name"], agent_type,
                                 "created session + window (no UUID)", "[yellow]WARN[/yellow]")
@@ -638,15 +692,23 @@ def cmd_restore(console: Console):
                     if uuid:
                         resume_cmd = build_resume_command(win)
                         # Target by pane PID to avoid ambiguity with duplicate names
-                        _send_keys_to_pane(session_name, matched_pane_pid, resume_cmd)
-                        results.add_row(session_name, win_name, agent_type,
-                                        f"resumed {agent_type} in existing window", "[green]OK[/green]")
+                        sk = _send_keys_to_pane(session_name, matched_pane_pid, resume_cmd)
+                        if sk.ok:
+                            results.add_row(session_name, win_name, agent_type,
+                                            f"resumed {agent_type} in existing window", "[green]OK[/green]")
+                        else:
+                            results.add_row(session_name, win_name, agent_type,
+                                            f"send-keys failed: {sk.reason}", "[red]FAIL[/red]")
                     else:
                         results.add_row(session_name, win_name, agent_type,
                                         "window exists but no UUID to resume", "[yellow]WARN[/yellow]")
             else:
                 # No unclaimed window with this name — create a new one
-                run(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
+                nw = run_full(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
+                if not nw.ok:
+                    results.add_row(session_name, win_name, agent_type,
+                                    f"new-window failed: {nw.reason}", "[red]FAIL[/red]")
+                    continue
                 if uuid:
                     resume_cmd = build_resume_command(win)
                     # Target the newly created window by finding its pane PID
@@ -658,13 +720,17 @@ def cmd_restore(console: Console):
                         if name == win_name and pid not in old_pids:
                             new_pane_pid = pid
                             break
-                    if new_pane_pid:
-                        _send_keys_to_pane(session_name, new_pane_pid, resume_cmd)
+                    if new_pane_pid is None:
+                        results.add_row(session_name, win_name, agent_type,
+                                        "new window not visible after create", "[red]FAIL[/red]")
                     else:
-                        # Fallback: target by name (works if no duplicates exist yet)
-                        run(["tmux", "send-keys", "-t", f"{session_name}:{win_name}", resume_cmd, "Enter"])
-                    results.add_row(session_name, win_name, agent_type,
-                                    f"created window + resumed {agent_type}", "[green]OK[/green]")
+                        sk = _send_keys_to_pane(session_name, new_pane_pid, resume_cmd)
+                        if sk.ok:
+                            results.add_row(session_name, win_name, agent_type,
+                                            f"created window + resumed {agent_type}", "[green]OK[/green]")
+                        else:
+                            results.add_row(session_name, win_name, agent_type,
+                                            f"send-keys failed: {sk.reason}", "[red]FAIL[/red]")
                     # Refresh so subsequent iterations see the new window
                     existing_windows = get_existing_windows(session_name)
                 else:
@@ -675,11 +741,17 @@ def cmd_restore(console: Console):
     console.print("\n[green]Restore complete.[/green]")
 
 
-def _send_keys_to_pane(session_name: str, pane_pid: int, keys: str):
-    """Send keys to a specific pane identified by its PID, avoiding name ambiguity."""
-    # Find the pane's tmux target by matching the PID
+def _send_keys_to_pane(session_name: str, pane_pid: int, keys: str) -> RunResult:
+    """Send keys to a specific pane identified by its PID, avoiding name ambiguity.
+
+    Returns the underlying tmux RunResult so callers can distinguish OK/FAIL.
+    On lookup failure (no pane with that PID), returns a synthetic non-zero
+    RunResult — we never silently fall back to name-based targeting (FX001-3).
+    """
+    # `list-panes -a` lists every pane across every session; `-t` is ignored
+    # alongside `-a`, so we drop it (cosmetic cleanup vs the original code).
     raw = run([
-        "tmux", "list-panes", "-t", session_name, "-a",
+        "tmux", "list-panes", "-a",
         "-F", "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}"
     ])
     target = None
@@ -688,11 +760,13 @@ def _send_keys_to_pane(session_name: str, pane_pid: int, keys: str):
         if len(parts) == 2 and parts[1].strip() == str(pane_pid):
             target = parts[0]
             break
-    if target:
-        run(["tmux", "send-keys", "-t", target, keys, "Enter"])
-    else:
-        # Fallback
-        run(["tmux", "send-keys", "-t", session_name, keys, "Enter"])
+    if not target:
+        return RunResult(
+            stdout="",
+            stderr=f"no pane with pid {pane_pid} in session {session_name!r}",
+            returncode=2,
+        )
+    return run_full(["tmux", "send-keys", "-t", target, keys, "Enter"])
 
 
 def _shell_quote(s: str) -> str:
