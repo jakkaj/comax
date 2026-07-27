@@ -1,9 +1,17 @@
 """comax: Save and restore tmux + Copilot CLI, Claude Code, and pi sessions.
 
 Usage:
-  comax              # Scan, display, and save state
-  comax --save       # Same as above
-  comax --restore    # Restore sessions from saved state
+  comax                        # Scan the whole machine, display, and save state
+  comax --save                 # Same as above
+  comax --restore              # Restore this folder's windows into the current
+                               #   tmux session
+  comax --restore --all        # Restore every saved session under its original
+                               #   name (post-reboot)
+  comax --dry-run              # Preview any of the above; changes nothing
+
+Save always records the whole machine. Restore is folder-scoped and
+session-local by default: it takes the saved windows whose cwd is exactly
+$PWD and rehydrates them into the tmux session you're attached to.
 
 Discovery:
   Copilot: process tree walk -> PID match against ~/.copilot/session-state/*/inuse.<PID>.lock
@@ -454,8 +462,10 @@ def discover_all(panes: list[PaneInfo]) -> list[AgentInstance]:
 # ── Save ──────────────────────────────────────────────────────────────────────
 
 
-def cmd_save(console: Console):
-    console.print(Panel("[bold]comax save[/bold]", style="blue"))
+def cmd_save(console: Console, dry: bool = False):
+    console.print(Panel(
+        "[bold]comax save[/bold]" + (" [cyan]- dry run[/cyan]" if dry else ""),
+        style="blue"))
 
     panes = get_tmux_panes()
     if not panes:
@@ -497,9 +507,10 @@ def cmd_save(console: Console):
         })
 
     # Write state file
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    if not dry:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
 
     # Display summary
     table = Table(title="Saved State", show_lines=True)
@@ -522,7 +533,10 @@ def cmd_save(console: Console):
             )
 
     console.print(table)
-    console.print(f"\n[green]State saved to {STATE_FILE}[/green]")
+    if dry:
+        console.print(f"\n[cyan]Dry run - state not written to {STATE_FILE}[/cyan]")
+    else:
+        console.print(f"\n[green]State saved to {STATE_FILE}[/green]")
 
     copilot_count = sum(1 for inst in instances if inst.agent_type == "copilot")
     claude_count = sum(1 for inst in instances if inst.agent_type == "claude")
@@ -561,6 +575,116 @@ def get_existing_windows(session_name: str) -> list[tuple[str, int]]:
         if len(parts) == 2:
             result.append((parts[0], int(parts[1])))
     return result
+
+
+def get_existing_windows_with_path(session_name: str) -> list[tuple[str, int, str]]:
+    """Like get_existing_windows but also returns each window's current path.
+
+    Folder-scoped restore lands every window in the *current* tmux session,
+    where saved window names routinely collide with unrelated live windows
+    ('node' and 'prime' are the usual offenders). Claiming a live window on
+    name alone would fire a resume into someone else's project, so the folder
+    path additionally requires the pane's cwd to match. The whole-machine
+    path is scoped to a window's original session and keeps using the
+    name-only helper above.
+    """
+    raw = run([
+        "tmux", "list-windows", "-t", session_name,
+        "-F", "#{window_name}|#{pane_pid}|#{pane_current_path}"
+    ])
+    if not raw:
+        return []
+    result = []
+    for line in raw.splitlines():
+        parts = line.split("|", 2)
+        if len(parts) == 3:
+            result.append((parts[0], int(parts[1]), parts[2]))
+    return result
+
+
+def get_current_tmux_session() -> str | None:
+    """Name of the tmux session we're running inside, or None if not in tmux.
+
+    Resolves through $TMUX_PANE rather than a bare `display-message -p`:
+    the bare form asks the *attached client* which session it's showing, so
+    it can report the wrong session (or fail) when several clients are
+    attached or when comax is run from a detached context. Targeting our own
+    pane id is unambiguous.
+    """
+    if not os.environ.get("TMUX"):
+        return None
+    pane = os.environ.get("TMUX_PANE")
+    if pane:
+        res = run_full(["tmux", "display-message", "-pt", pane, "#{session_name}"])
+        if res.ok and res.stdout:
+            return res.stdout
+    res = run_full(["tmux", "display-message", "-p", "#{session_name}"])
+    return res.stdout if res.ok and res.stdout else None
+
+
+def _resolve_folder(path: str) -> Path:
+    """Normalise a folder path for comparison (expanduser + resolve).
+
+    resolve() is non-strict on 3.12, so paths that no longer exist normalise
+    rather than raise — a saved cwd for a deleted directory simply fails to
+    match instead of blowing up the restore.
+    """
+    return Path(path).expanduser().resolve()
+
+
+def _same_folder(saved_cwd: str | None, target: Path) -> bool:
+    """True iff a saved window's cwd is exactly the target folder.
+
+    Exact match, not subtree: worktrees like `pij` and
+    `pij-worktrees/pr14-…` are separate projects that happen to share a
+    prefix, and each should restore only its own windows. Component-wise
+    Path comparison also means `SecondCrack` never matches
+    `SecondCrack-s024`.
+    """
+    if not saved_cwd:
+        return False
+    try:
+        return _resolve_folder(saved_cwd) == target
+    except (OSError, ValueError):
+        return False
+
+
+def select_windows_for_folder(state: dict, folder: Path) -> tuple[list[dict], int]:
+    """Pick saved windows whose cwd is `folder`, in state-file order.
+
+    Returns (matches, skipped_without_cwd). Each match is the saved window
+    dict plus `_origin_session` — the tmux session it was saved under, kept
+    for display only: folder restore always targets the current session.
+
+    Windows saved with cwd=None can't be attributed to any folder (the agent
+    was detected but its cwd couldn't be read). They're counted so we can
+    tell the operator they exist rather than dropping them silently.
+    """
+    matches: list[dict] = []
+    skipped_without_cwd = 0
+    for session in state.get("sessions", []):
+        for win in session.get("windows", []):
+            if not win.get("cwd"):
+                skipped_without_cwd += 1
+                continue
+            if _same_folder(win.get("cwd"), folder):
+                matches.append({**win, "_origin_session": session.get("name", "?")})
+    return matches, skipped_without_cwd
+
+
+def summarize_saved_folders(state: dict, limit: int = 5) -> list[tuple[str, int]]:
+    """Folders that do have saved windows, most-populated first.
+
+    Used to make a zero-match restore actionable — otherwise the operator
+    just sees 'nothing to do' while the state file is full of other projects.
+    """
+    counts: dict[str, int] = {}
+    for session in state.get("sessions", []):
+        for win in session.get("windows", []):
+            cwd = win.get("cwd")
+            if cwd:
+                counts[cwd] = counts.get(cwd, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
 
 
 def is_session_alive(agent_type: str, uuid: str) -> bool:
@@ -635,13 +759,192 @@ def build_resume_command(win: dict) -> str:
     return resume_cmd
 
 
-def cmd_restore(console: Console):
-    console.print(Panel("[bold]comax restore[/bold]", style="blue"))
+class RestoreReport:
+    """The restore results table, plus a tally for the closing summary.
+
+    In dry-run mode an extra Command column carries the exact string that
+    would be sent, so a preview can be read as 'this is what will happen'
+    without cross-referencing anything.
+    """
+
+    def __init__(self, dry: bool, title: str | None = None):
+        self.dry = dry
+        self.counts: dict[str, int] = {}
+        self.table = Table(
+            title=title or ("Restore Plan (dry run)" if dry else "Restore Results"),
+            show_lines=True,
+        )
+        self.table.add_column("Session", style="cyan")
+        self.table.add_column("Window", style="green")
+        self.table.add_column("Agent", style="magenta")
+        self.table.add_column("Action", style="yellow")
+        if dry:
+            self.table.add_column("Command", style="dim", overflow="fold")
+        self.table.add_column("Status", style="bold")
+
+    def add(self, session: str, window: str, agent: str, action: str,
+            status: str, command: str = "") -> None:
+        self.counts[status] = self.counts.get(status, 0) + 1
+        row = [session, window, agent, action]
+        if self.dry:
+            row.append(command or "-")
+        row.append(_STATUS_MARKUP[status])
+        self.table.add_row(*row)
+
+    def summary(self) -> str:
+        if not self.counts:
+            return ""
+        order = ["OK", "DRY", "SKIP", "WARN", "FAIL"]
+        parts = [f"{self.counts[s]} {s}" for s in order if s in self.counts]
+        return "  ".join(parts)
+
+
+_STATUS_MARKUP = {
+    "OK": "[green]OK[/green]",
+    "SKIP": "[green]SKIP[/green]",
+    "WARN": "[yellow]WARN[/yellow]",
+    "FAIL": "[red]FAIL[/red]",
+    "DRY": "[cyan]DRY[/cyan]",
+}
+
+
+def _stale_note(uuid: str) -> str:
+    return f"uuid stale ({uuid[:8]}…), agent not resumed"
+
+
+def _restore_into_existing_pane(report: RestoreReport, session_name: str, win: dict,
+                                pane_pid: int, dry: bool) -> None:
+    """Resume an agent in a pane that already exists.
+
+    Shared by folder-scoped and whole-machine restore so the ladder below
+    (already-running / stale-uuid / no-uuid / resume) has exactly one
+    implementation.
+    """
+    win_name = win["name"]
+    agent_type = win.get("agent_type", "copilot")
+    uuid = win.get("session_uuid")
+
+    if pane_has_agent(pane_pid, agent_type):
+        report.add(session_name, win_name, agent_type,
+                   f"{agent_type} already running", "SKIP")
+        return
+
+    if uuid and not is_session_alive(agent_type, uuid):
+        report.add(session_name, win_name, agent_type,
+                   f"window exists; {_stale_note(uuid)}", "WARN")
+        return
+
+    if not uuid:
+        report.add(session_name, win_name, agent_type,
+                   "window exists but no UUID to resume", "WARN")
+        return
+
+    resume_cmd = build_resume_command(win)
+    if dry:
+        report.add(session_name, win_name, agent_type,
+                   f"would resume {agent_type} in existing window", "DRY", resume_cmd)
+        return
+
+    # Target by pane PID to avoid ambiguity with duplicate names
+    sk = _send_keys_to_pane(session_name, pane_pid, resume_cmd)
+    if sk.ok:
+        report.add(session_name, win_name, agent_type,
+                   f"resumed {agent_type} in existing window", "OK")
+    else:
+        report.add(session_name, win_name, agent_type,
+                   f"send-keys failed: {sk.reason}", "FAIL")
+
+
+def _create_window_and_resume(report: RestoreReport, session_name: str, win: dict,
+                              win_cwd: str, existing_windows: list, dry: bool) -> list:
+    """Create a new window in an existing session and resume its agent.
+
+    `existing_windows` is the caller's [(name, pid), ...] snapshot, used to
+    identify which window is the newly created one. Returns a refreshed
+    snapshot so callers can keep claiming against current reality.
+    """
+    win_name = win["name"]
+    agent_type = win.get("agent_type", "copilot")
+    uuid = win.get("session_uuid")
+
+    if uuid and not is_session_alive(agent_type, uuid):
+        action = ("would create window; " if dry else "window created; ") + _stale_note(uuid)
+        if dry:
+            report.add(session_name, win_name, agent_type, action, "WARN")
+            return existing_windows
+        nw = run_full(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
+        if not nw.ok:
+            report.add(session_name, win_name, agent_type,
+                       f"new-window failed: {nw.reason}", "FAIL")
+            return existing_windows
+        report.add(session_name, win_name, agent_type, action, "WARN")
+        return get_existing_windows(session_name)
+
+    if not uuid:
+        if dry:
+            report.add(session_name, win_name, agent_type,
+                       "would create window (no UUID)", "WARN")
+            return existing_windows
+        nw = run_full(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
+        if not nw.ok:
+            report.add(session_name, win_name, agent_type,
+                       f"new-window failed: {nw.reason}", "FAIL")
+            return existing_windows
+        report.add(session_name, win_name, agent_type, "created window (no UUID)", "WARN")
+        return get_existing_windows(session_name)
+
+    resume_cmd = build_resume_command(win)
+    if dry:
+        report.add(session_name, win_name, agent_type,
+                   f"would create window + resume {agent_type}", "DRY", resume_cmd)
+        return existing_windows
+
+    nw = run_full(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
+    if not nw.ok:
+        report.add(session_name, win_name, agent_type,
+                   f"new-window failed: {nw.reason}", "FAIL")
+        return existing_windows
+
+    # Target the newly created window by finding its pane PID: the one that
+    # wasn't in our previous snapshot.
+    refreshed = get_existing_windows(session_name)
+    old_pids = {pid for _, pid in existing_windows}
+    new_pane_pid = None
+    for name, pid in refreshed:
+        if name == win_name and pid not in old_pids:
+            new_pane_pid = pid
+            break
+
+    if new_pane_pid is None:
+        report.add(session_name, win_name, agent_type,
+                   "new window not visible after create", "FAIL")
+    else:
+        _settle_new_pane()
+        sk = _send_keys_to_pane(session_name, new_pane_pid, resume_cmd)
+        if sk.ok:
+            report.add(session_name, win_name, agent_type,
+                       f"created window + resumed {agent_type}", "OK")
+        else:
+            report.add(session_name, win_name, agent_type,
+                       f"send-keys failed: {sk.reason}", "FAIL")
+    return refreshed
+
+
+def cmd_restore(console: Console, dry: bool = False) -> int:
+    """Whole-machine restore: every saved session, under its original name.
+
+    Reached via `--restore --all`. This is the post-reboot path; the default
+    restore is folder-scoped (see cmd_restore_folder).
+    """
+    console.print(Panel(
+        "[bold]comax restore[/bold] [dim](whole machine)[/dim]"
+        + (" [cyan]- dry run[/cyan]" if dry else ""),
+        style="blue"))
 
     if not STATE_FILE.exists():
         console.print(f"[red]No saved state found at {STATE_FILE}[/red]")
         console.print("[dim]Run 'comax' or 'comax --save' first to save current state.[/dim]")
-        return
+        return 1
 
     with open(STATE_FILE) as f:
         state = json.load(f)
@@ -653,16 +956,10 @@ def cmd_restore(console: Console):
 
     if not sessions:
         console.print("[yellow]Nothing to restore.[/yellow]")
-        return
+        return 0
 
     existing_sessions = get_existing_tmux_sessions()
-
-    results = Table(title="Restore Results", show_lines=True)
-    results.add_column("Session", style="cyan")
-    results.add_column("Window", style="green")
-    results.add_column("Agent", style="magenta")
-    results.add_column("Action", style="yellow")
-    results.add_column("Status", style="bold")
+    report = RestoreReport(dry)
 
     for session in sessions:
         session_name = session["name"]
@@ -677,43 +974,64 @@ def cmd_restore(console: Console):
             first_win = windows[0]
             win_cwd = first_win.get("cwd") or first_cwd
             agent_type = first_win.get("agent_type", "copilot")
+            uuid = first_win.get("session_uuid")
+
+            if dry:
+                # Preview only: no session is created, so there is no pane to
+                # resolve. Report the intent, then preview the rest of this
+                # session's windows as new-window creations.
+                if uuid and not is_session_alive(agent_type, uuid):
+                    report.add(session_name, first_win["name"], agent_type,
+                               "would create session + window; " + _stale_note(uuid), "WARN")
+                elif uuid:
+                    report.add(session_name, first_win["name"], agent_type,
+                               "would create session + window + resume", "DRY",
+                               build_resume_command(first_win))
+                else:
+                    report.add(session_name, first_win["name"], agent_type,
+                               "would create session + window (no UUID)", "WARN")
+                existing_sessions.add(session_name)
+                for win in windows[1:]:
+                    _create_window_and_resume(
+                        report, session_name, win,
+                        win.get("cwd") or first_cwd, [], dry=True)
+                continue
+
             new_sess = run_full(["tmux", "new-session", "-d", "-s", session_name,
                                   "-n", first_win["name"], "-c", win_cwd])
             if not new_sess.ok:
-                results.add_row(session_name, first_win["name"], agent_type,
-                                f"new-session failed: {new_sess.reason}", "[red]FAIL[/red]")
-                # Skip the rest of this tmux session — nothing else will work.
+                report.add(session_name, first_win["name"], agent_type,
+                           f"new-session failed: {new_sess.reason}", "FAIL")
+                # Skip the rest of this tmux session - nothing else will work.
                 continue
 
-            uuid = first_win.get("session_uuid")
             if uuid and not is_session_alive(agent_type, uuid):
-                results.add_row(session_name, first_win["name"], agent_type,
-                                f"window created; uuid stale ({uuid[:8]}\u2026), agent not resumed",
-                                "[yellow]WARN[/yellow]")
+                report.add(session_name, first_win["name"], agent_type,
+                           "window created; " + _stale_note(uuid), "WARN")
             elif uuid:
                 resume_cmd = build_resume_command(first_win)
                 # Look up the freshly-created pane by PID so we can send-keys
                 # via an unambiguous `<session>:<window_idx>.<pane_idx>` target.
                 # Name-based targeting (`<session>:<window_name>`) breaks when
-                # the window name contains a '.' — tmux mis-parses it as a
+                # the window name contains a '.' - tmux mis-parses it as a
                 # window/pane index expression (see FX001-3).
                 fresh = get_existing_windows(session_name)
                 first_pid = next((pid for n, pid in fresh if n == first_win["name"]), None)
                 if first_pid is None:
-                    results.add_row(session_name, first_win["name"], agent_type,
-                                    "new window not visible after create", "[red]FAIL[/red]")
+                    report.add(session_name, first_win["name"], agent_type,
+                               "new window not visible after create", "FAIL")
                 else:
                     _settle_new_pane()
                     sk = _send_keys_to_pane(session_name, first_pid, resume_cmd)
                     if sk.ok:
-                        results.add_row(session_name, first_win["name"], agent_type,
-                                        "created session + window + resumed", "[green]OK[/green]")
+                        report.add(session_name, first_win["name"], agent_type,
+                                   "created session + window + resumed", "OK")
                     else:
-                        results.add_row(session_name, first_win["name"], agent_type,
-                                        f"send-keys failed: {sk.reason}", "[red]FAIL[/red]")
+                        report.add(session_name, first_win["name"], agent_type,
+                                   f"send-keys failed: {sk.reason}", "FAIL")
             else:
-                results.add_row(session_name, first_win["name"], agent_type,
-                                "created session + window (no UUID)", "[yellow]WARN[/yellow]")
+                report.add(session_name, first_win["name"], agent_type,
+                           "created session + window (no UUID)", "WARN")
 
             existing_sessions.add(session_name)
             remaining_windows = windows[1:]
@@ -727,8 +1045,6 @@ def cmd_restore(console: Console):
         for win in remaining_windows:
             win_name = win["name"]
             win_cwd = win.get("cwd") or first_cwd
-            uuid = win.get("session_uuid")
-            agent_type = win.get("agent_type", "copilot")
 
             # Find an unclaimed existing window with this name
             matched_idx = None
@@ -741,72 +1057,130 @@ def cmd_restore(console: Console):
 
             if matched_idx is not None:
                 claimed.add(matched_idx)
-                if pane_has_agent(matched_pane_pid, agent_type):
-                    results.add_row(session_name, win_name, agent_type,
-                                    f"{agent_type} already running", "[green]SKIP[/green]")
-                else:
-                    if uuid and not is_session_alive(agent_type, uuid):
-                        results.add_row(session_name, win_name, agent_type,
-                                        f"window exists; uuid stale ({uuid[:8]}\u2026), agent not resumed",
-                                        "[yellow]WARN[/yellow]")
-                    elif uuid:
-                        resume_cmd = build_resume_command(win)
-                        # Target by pane PID to avoid ambiguity with duplicate names
-                        sk = _send_keys_to_pane(session_name, matched_pane_pid, resume_cmd)
-                        if sk.ok:
-                            results.add_row(session_name, win_name, agent_type,
-                                            f"resumed {agent_type} in existing window", "[green]OK[/green]")
-                        else:
-                            results.add_row(session_name, win_name, agent_type,
-                                            f"send-keys failed: {sk.reason}", "[red]FAIL[/red]")
-                    else:
-                        results.add_row(session_name, win_name, agent_type,
-                                        "window exists but no UUID to resume", "[yellow]WARN[/yellow]")
+                _restore_into_existing_pane(report, session_name, win,
+                                            matched_pane_pid, dry)
             else:
-                # No unclaimed window with this name — create a new one
-                nw = run_full(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
-                if not nw.ok:
-                    results.add_row(session_name, win_name, agent_type,
-                                    f"new-window failed: {nw.reason}", "[red]FAIL[/red]")
-                    continue
-                if uuid and not is_session_alive(agent_type, uuid):
-                    results.add_row(session_name, win_name, agent_type,
-                                    f"window created; uuid stale ({uuid[:8]}\u2026), agent not resumed",
-                                    "[yellow]WARN[/yellow]")
-                    # Refresh so subsequent iterations see the new window
-                    existing_windows = get_existing_windows(session_name)
-                    continue
-                if uuid:
-                    resume_cmd = build_resume_command(win)
-                    # Target the newly created window by finding its pane PID
-                    refreshed = get_existing_windows(session_name)
-                    # The new window is the one not in our previous list
-                    old_pids = {pid for _, pid in existing_windows}
-                    new_pane_pid = None
-                    for name, pid in refreshed:
-                        if name == win_name and pid not in old_pids:
-                            new_pane_pid = pid
-                            break
-                    if new_pane_pid is None:
-                        results.add_row(session_name, win_name, agent_type,
-                                        "new window not visible after create", "[red]FAIL[/red]")
-                    else:
-                        _settle_new_pane()
-                        sk = _send_keys_to_pane(session_name, new_pane_pid, resume_cmd)
-                        if sk.ok:
-                            results.add_row(session_name, win_name, agent_type,
-                                            f"created window + resumed {agent_type}", "[green]OK[/green]")
-                        else:
-                            results.add_row(session_name, win_name, agent_type,
-                                            f"send-keys failed: {sk.reason}", "[red]FAIL[/red]")
-                    # Refresh so subsequent iterations see the new window
-                    existing_windows = get_existing_windows(session_name)
-                else:
-                    results.add_row(session_name, win_name, agent_type,
-                                    "created window (no UUID)", "[yellow]WARN[/yellow]")
+                # No unclaimed window with this name - create a new one
+                existing_windows = _create_window_and_resume(
+                    report, session_name, win, win_cwd, existing_windows, dry)
 
-    console.print(results)
-    console.print("\n[green]Restore complete.[/green]")
+    _print_report(console, report, dry)
+    return 0
+
+
+def _print_report(console: Console, report: RestoreReport, dry: bool) -> None:
+    console.print(report.table)
+    summary = report.summary()
+    if summary:
+        console.print(f"\n[dim]{summary}[/dim]")
+    if dry:
+        console.print("[cyan]Dry run - no tmux changes were made.[/cyan]")
+    else:
+        console.print("\n[green]Restore complete.[/green]")
+
+
+def cmd_restore_folder(console: Console, dry: bool = False) -> int:
+    """Restore the saved windows for the current folder into the current session.
+
+    This is the default restore mode. Whole-machine restore (`--all`) is the
+    post-reboot tool; day to day you are sitting in one tmux session working
+    on one project and want that project's windows back, not everyone's.
+    """
+    console.print(Panel(
+        "[bold]comax restore[/bold] [dim](this folder)[/dim]"
+        + (" [cyan]- dry run[/cyan]" if dry else ""),
+        style="blue"))
+
+    if not STATE_FILE.exists():
+        console.print(f"[red]No saved state found at {STATE_FILE}[/red]")
+        console.print("[dim]Run 'comax' or 'comax --save' first to save current state.[/dim]")
+        return 1
+
+    with open(STATE_FILE) as f:
+        state = json.load(f)
+
+    folder = _resolve_folder(os.getcwd())
+    target_session = get_current_tmux_session()
+
+    # A real restore must land somewhere; a dry run is a preview and stays
+    # useful (and safe) from outside tmux.
+    if target_session is None and not dry:
+        console.print("[red]Error: not inside a tmux session.[/red]\n")
+        console.print("comax --restore rehydrates into the session you're attached to. "
+                      "Start one first:\n")
+        console.print(f"    [bold]tmux new -s {folder.name}[/bold]\n")
+        console.print("[dim](or use --dry-run to preview from anywhere, "
+                      "or --all for whole-machine restore)[/dim]")
+        return 1
+
+    matches, skipped_without_cwd = select_windows_for_folder(state, folder)
+
+    saved_at = state.get("saved_at", "unknown")
+    console.print(f"\n[dim]State saved at: {saved_at}[/dim]")
+    console.print(f"[dim]Folder:  {folder}[/dim]")
+    console.print(f"[dim]Session: {target_session or '<current tmux session>'}[/dim]")
+    console.print(f"[dim]{len(matches)} saved window(s) for this folder[/dim]\n")
+
+    if not matches:
+        console.print("[yellow]No saved windows for this folder.[/yellow]")
+        others = summarize_saved_folders(state)
+        if others:
+            console.print("\n[dim]Folders with saved windows:[/dim]")
+            for path, count in others:
+                console.print(f"  [dim]{count:>3}[/dim]  {path}")
+            console.print("\n[dim]cd to one of those, or use --all to restore "
+                          "everything.[/dim]")
+        if skipped_without_cwd:
+            console.print(f"\n[dim]note: {skipped_without_cwd} saved window(s) have no "
+                          "recorded cwd and can't be folder-matched; use --all to "
+                          "restore them.[/dim]")
+        return 0
+
+    report = RestoreReport(dry)
+    session_name = target_session or "<current>"
+
+    # Claim live windows on name AND path: everything lands in the current
+    # session, where saved window names routinely collide with unrelated live
+    # ones ('node', 'prime'). Name-only matching would fire a resume into
+    # another project's pane.
+    live = get_existing_windows_with_path(target_session) if target_session else []
+    # Claims are tracked by pane PID, not list index: creating a window
+    # re-orders the live list, and PIDs stay stable across refreshes.
+    claimed_pids: set[int] = set()
+    # [(name, pid), ...] view for the create path's new-window detection.
+    existing_windows = [(name, pid) for name, pid, _ in live]
+
+    for win in matches:
+        win_name = win["name"]
+
+        matched_pane_pid = None
+        for name, pane_pid, pane_path in live:
+            if pane_pid in claimed_pids or name != win_name:
+                continue
+            if not _same_folder(pane_path, folder):
+                continue
+            claimed_pids.add(pane_pid)
+            matched_pane_pid = pane_pid
+            break
+
+        if matched_pane_pid is not None:
+            _restore_into_existing_pane(report, session_name, win,
+                                        matched_pane_pid, dry)
+        else:
+            before_pids = {pid for _, pid in existing_windows}
+            existing_windows = _create_window_and_resume(
+                report, session_name, win, str(folder), existing_windows, dry)
+            if not dry and target_session:
+                # Claim whatever pane we just created, and refresh the
+                # path-aware view so a later window cannot re-claim it.
+                claimed_pids |= {pid for _, pid in existing_windows} - before_pids
+                live = get_existing_windows_with_path(target_session)
+
+    _print_report(console, report, dry)
+    if skipped_without_cwd:
+        console.print(f"[dim]note: {skipped_without_cwd} saved window(s) have no recorded "
+                      "cwd and can't be folder-matched; use --all to restore them.[/dim]")
+    return 0
 
 
 def _send_keys_to_pane(session_name: str, pane_pid: int, keys: str) -> RunResult:
@@ -847,19 +1221,38 @@ def _shell_quote(s: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="comax: save/restore tmux + Copilot CLI, Claude Code, and pi sessions")
+    parser = argparse.ArgumentParser(
+        description="comax: save/restore tmux + Copilot CLI, Claude Code, and pi sessions",
+        epilog=(
+            "comax                        save the whole machine\n"
+            "comax --restore              restore this folder into the current tmux session\n"
+            "comax --restore --dry-run    preview the above\n"
+            "comax --restore --all        restore every saved session (post-reboot)\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--save", action="store_true", default=True, help="Scan and save state (default)")
-    group.add_argument("--restore", action="store_true", help="Restore sessions from saved state")
+    group.add_argument("--restore", action="store_true",
+                       help="Restore saved windows for the current folder into the current tmux session")
+    parser.add_argument("--all", action="store_true",
+                        help="With --restore: restore every saved session under its original name")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would happen without changing anything")
     args = parser.parse_args()
+
+    if args.all and not args.restore:
+        parser.error("--all only applies to --restore")
 
     console = Console()
 
     if args.restore:
-        cmd_restore(console)
-    else:
-        cmd_save(console)
+        if args.all:
+            return cmd_restore(console, dry=args.dry_run)
+        return cmd_restore_folder(console, dry=args.dry_run)
+    cmd_save(console, dry=args.dry_run)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

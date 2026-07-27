@@ -22,6 +22,7 @@ All three are saved to `~/.config/comax/state.json` with session UUIDs, working 
 - Session exists but window was killed → creates just the missing window
 - Window exists but agent stopped → resumes in the existing pane
 - Everything already running → skips (no-op)
+- Saved session UUID no longer on disk → warns instead of leaving a broken pane
 
 Each agent is resumed with the correct command (`copilot --yolo --resume <uuid>`, `claude --resume <uuid>`, or `pi --session <uuid>`) from the right working directory.
 
@@ -55,9 +56,38 @@ uvx --from git+https://github.com/jakkaj/comax.git comax
 ## Usage
 
 ```bash
-# Save current tmux/agent state
+# Save current tmux/agent state (whole machine)
 comax
 
-# Restore from saved state
+# Restore this folder's windows into the tmux session you're in
 comax --restore
+
+# See exactly what a restore would do, without touching tmux
+comax --restore --dry-run
+
+# Restore everything, every session under its original name (post-reboot)
+comax --restore --all
 ```
+
+**Save records the whole machine. Restore is scoped to one folder by default.**
+
+Day to day you're in one tmux session working on one project, so plain
+`comax --restore` takes only the saved windows whose cwd is exactly your current
+directory and rehydrates them into the session you're already attached to —
+regardless of which session they were originally saved under. The match is exact,
+not recursive, so a worktree (`myrepo-worktrees/feature-x`) restores its own
+windows and never its parent's.
+
+After a reboot, when you want the whole machine back, use `--restore --all`. That's
+the original behaviour: every saved session recreated under its own name.
+
+`--dry-run` works on any command. On restore it prints the full plan — every window,
+its status, and the exact command that would be sent — and makes zero tmux changes.
+On save it scans and displays without writing the state file.
+
+### Notes
+
+- `comax --restore` must be run from inside tmux, since it restores into your current
+  session. It exits with an error otherwise. `--dry-run` works from anywhere.
+- Windows saved without a recorded cwd can't be matched to a folder. They're excluded
+  from folder restores, with a note telling you how many; `--all` still restores them.
