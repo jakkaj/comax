@@ -273,23 +273,45 @@ def read_copilot_metadata(uuid: str) -> tuple[str | None, str | None]:
         return None, None
 
 
+# Flags carried across a restore, per agent. Deliberately a short allowlist
+# of value-less switches rather than a faithful argv replay.
+#
+# The old code kept every token starting with "--" and dropped the values
+# in between, so `--model gpt-5 --session-id <uuid>` was saved as
+# `--model --session-id` and restored into a command that either misparsed
+# ("option '--context <tier>' argument '--effort' is invalid") or swallowed
+# the resume UUID as a flag value ("too many arguments"). Reconstructing
+# values correctly would mean tracking each CLI's arity; carrying only
+# value-less switches needs no such knowledge and cannot malform a command.
+#
+# Session identity is NOT taken from argv — it comes from the saved UUID via
+# build_resume_command. Flags that also select a session (--session-id,
+# --continue, --resume) must therefore never be carried, or they would fight
+# the resume flag.
+#
+# Trade-off: launch options like --model / --effort / --context are not
+# restored; the agent comes back on its default configuration, as already
+# documented for pi. Adding one here is a one-line change.
+RESTORE_SAFE_FLAGS: dict[str, tuple[str, ...]] = {
+    "copilot": ("--yolo",),
+    "claude": ("--dangerously-skip-permissions",),
+    "pi": (),
+}
+
+
+def extract_agent_args(agent_type: str, command: str) -> str:
+    """Flags worth replaying when resuming this agent.
+
+    Emitted in allowlist order, not argv order, so the saved string is
+    stable across restarts.
+    """
+    toks = set(command.split())
+    return " ".join(f for f in RESTORE_SAFE_FLAGS.get(agent_type, ()) if f in toks)
+
+
 def extract_copilot_args(command: str) -> str:
-    """Extract copilot flags minus --resume and its value."""
-    parts = command.split()
-    args = []
-    skip_next = False
-    for part in parts:
-        if skip_next:
-            skip_next = False
-            continue
-        if part == "--resume":
-            skip_next = True
-            continue
-        if part.startswith("--resume="):
-            continue
-        if part.startswith("--"):
-            args.append(part)
-    return " ".join(args) if args else "--yolo"
+    """Extract the copilot flags that are safe to replay on resume."""
+    return extract_agent_args("copilot", command)
 
 
 def find_copilot_in_pane(pane: PaneInfo, lock_index: dict[int, str]) -> AgentInstance | None:
@@ -345,26 +367,8 @@ def build_claude_session_index() -> dict[int, dict]:
 
 
 def extract_claude_args(command: str) -> str:
-    """Extract claude flags minus --resume and its value."""
-    parts = command.split()
-    args = []
-    skip_next = False
-    for part in parts:
-        if skip_next:
-            skip_next = False
-            continue
-        if part == "--resume":
-            skip_next = True
-            continue
-        if part.startswith("--resume="):
-            continue
-        # Skip the binary name itself
-        binary = part.split("/")[-1].lower()
-        if binary == "claude":
-            continue
-        if part.startswith("--") or part.startswith("-"):
-            args.append(part)
-    return " ".join(args) if args else ""
+    """Extract the claude flags that are safe to replay on resume."""
+    return extract_agent_args("claude", command)
 
 
 def find_claude_in_pane(pane: PaneInfo, claude_index: dict[int, dict]) -> AgentInstance | None:

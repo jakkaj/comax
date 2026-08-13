@@ -16,6 +16,14 @@ All three are saved to `~/.config/comax/state.json` with session UUIDs, working 
 
 > **Note on pi flags**: pi rewrites `argv[0]` to just `"pi"`, so launch flags (model, thinking level, extensions, etc.) cannot be recovered. pi sessions are restored with `pi --session <uuid>` from the saved cwd, which resumes the conversation but uses pi's default configuration.
 
+> **Note on launch flags**: only value-less switches that are safe to replay are
+> carried across a restore — `--yolo` for copilot, `--dangerously-skip-permissions`
+> for claude. Options that take a value (`--model`, `--effort`, `--context`) are not
+> restored, so an agent comes back on its default configuration. Session-selecting
+> flags (`--session-id`, `--continue`) are deliberately dropped too, since the saved
+> UUID already supplies the session via `--resume`; carrying them would produce a
+> command that fights itself.
+
 **Restore** reads the saved state and intelligently rehydrates:
 
 - Missing tmux session → creates it with all windows
