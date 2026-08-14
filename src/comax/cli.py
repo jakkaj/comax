@@ -40,6 +40,7 @@ CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 PI_DB_DIR = Path.home() / ".pi" / "db" / "session-sql"
 PI_SESSIONS_DIR = Path.home() / ".pi" / "agent" / "sessions"
+OMP_SESSIONS_DIR = Path.home() / ".omp" / "agent" / "sessions"
 CONFIG_DIR = Path.home() / ".config" / "comax"
 STATE_FILE = CONFIG_DIR / "state.json"
 
@@ -171,14 +172,18 @@ def get_child_pids(pid: int) -> list[int]:
 def get_process_command(pid: int) -> str:
     return run(["ps", "-o", "command=", "-p", str(pid)])
 
-def _is_copilot_process(cmd: str) -> bool:
-    """True iff the command line represents a copilot agent process.
+# Interpreters that front a JS CLI, so the real binary is argv[1]:
+#   node /path/to/copilot --yolo
+#   bun  /path/to/omp --auto-approve
+_WRAPPER_BINARIES = ("node", "bun", "bunx", "npx", "deno")
 
-    Matches:
-      * `copilot ...` and `/abs/path/to/copilot ...`
-      * `node /abs/path/to/copilot ...` (the npm wrapper invocation pattern)
 
-    Rejects anything where 'copilot' merely appears as a substring of an
+def _is_agent_binary(cmd: str, name: str) -> bool:
+    """True iff argv[0] (or argv[1] behind a wrapper) is the named binary.
+
+    Matches `name ...`, `/abs/path/to/name ...`, and `node /abs/path/name ...`.
+
+    Rejects anything where the name merely appears as a substring of an
     argument (e.g. `lean-ctx -c 'build_copilot_lock_index'`, `gh copilot ...`,
     `grep copilot`). Restricting to argv[0]/argv[1] basenames removes those
     false positives without losing the real npm-wrapper detection.
@@ -187,11 +192,37 @@ def _is_copilot_process(cmd: str) -> bool:
     if not toks:
         return False
     argv0 = toks[0].split("/")[-1].lower()
-    if argv0 == "copilot":
+    if argv0 == name:
         return True
-    if argv0 == "node" and len(toks) >= 2:
-        return toks[1].split("/")[-1].lower() == "copilot"
+    # Strip a .exe suffix: tmux reports bun as 'bun.exe' in pane_current_command.
+    if argv0.removesuffix(".exe") in _WRAPPER_BINARIES and len(toks) >= 2:
+        return toks[1].split("/")[-1].lower() == name
     return False
+
+
+def _is_copilot_process(cmd: str) -> bool:
+    """True iff the command line represents a copilot agent process."""
+    return _is_agent_binary(cmd, "copilot")
+
+
+def _is_omp_process(cmd: str) -> bool:
+    """True iff the command line represents an omp (oh-my-pi) agent process.
+
+    omp ships as a bun-wrapped JS binary, so the real name is argv[1]:
+        bun /Users/x/.npm-global/bin/omp --auto-approve --resume=...
+    """
+    return _is_agent_binary(cmd, "omp")
+
+
+def pane_process_candidates(pane_pid: int) -> list[int]:
+    """PIDs that could be the agent for a pane: the pane process, then children.
+
+    Usually a pane's root process is the shell and the agent is a child. But
+    an agent exec'd directly as the pane command IS the pane process, with no
+    shell in between — that is how omp runs under pij, and a children-only
+    scan misses it entirely (its only children are MCP servers).
+    """
+    return [pane_pid] + get_child_pids(pane_pid)
 
 def get_process_cwd(pid: int) -> str | None:
     """Get the working directory of a process via lsof."""
@@ -226,11 +257,14 @@ def pane_has_agent(pane_pid: int, agent_type: str) -> bool:
     if agent_type == "copilot":
         tree = walk_process_tree(pane_pid)
         return any(_is_copilot_process(cmd) for _, cmd, _ in tree)
-    elif agent_type in ("claude", "pi"):
-        # Direct child of the shell; match by binary basename to avoid false positives
-        # (e.g. 'python' contains 'pi', 'copilot' contains 'pi').
-        for child_pid in get_child_pids(pane_pid):
-            cmd = get_process_command(child_pid)
+    if agent_type == "omp":
+        return any(_is_omp_process(get_process_command(pid))
+                   for pid in pane_process_candidates(pane_pid))
+    if agent_type in ("claude", "pi"):
+        # The pane process itself or a direct child; match by binary basename to
+        # avoid false positives (e.g. 'python' contains 'pi').
+        for pid in pane_process_candidates(pane_pid):
+            cmd = get_process_command(pid)
             if cmd:
                 binary = cmd.split()[0].split("/")[-1].lower()
                 if binary == agent_type:
@@ -296,6 +330,8 @@ RESTORE_SAFE_FLAGS: dict[str, tuple[str, ...]] = {
     "copilot": ("--yolo",),
     "claude": ("--dangerously-skip-permissions",),
     "pi": (),
+    # omp preserves argv (pi does not), so its switches are actually recoverable.
+    "omp": ("--auto-approve",),
 }
 
 
@@ -372,8 +408,8 @@ def extract_claude_args(command: str) -> str:
 
 
 def find_claude_in_pane(pane: PaneInfo, claude_index: dict[int, dict]) -> AgentInstance | None:
-    # Check direct children of the pane shell
-    for child_pid in get_child_pids(pane.pane_pid):
+    # The pane process itself, or a direct child of the pane shell
+    for child_pid in pane_process_candidates(pane.pane_pid):
         cmd = get_process_command(child_pid)
         if not cmd:
             continue
@@ -414,7 +450,7 @@ def find_pi_in_pane(pane: PaneInfo) -> AgentInstance | None:
     launch flags (model, thinking level, extensions, etc.). We capture cwd
     and session UUID — enough to resume the conversation in place.
     """
-    for child_pid in get_child_pids(pane.pane_pid):
+    for child_pid in pane_process_candidates(pane.pane_pid):
         cmd = get_process_command(child_pid)
         if not cmd:
             continue
@@ -432,6 +468,61 @@ def find_pi_in_pane(pane: PaneInfo) -> AgentInstance | None:
             args="",
         )
     return None
+
+# ── omp (oh-my-pi) discovery ──────────────────────────────────────────────────
+
+def _uuid_from_omp_session_path(path: str) -> str | None:
+    """Pull the session UUID out of an omp session filename.
+
+    Layout mirrors pi's: ~/.omp/agent/sessions/<encoded-cwd>/<ts>_<uuid>.jsonl
+    e.g. 2026-08-12T00-12-25-200Z_019ff350-2af0-7000-a683-0add1323c149.jsonl
+    The timestamp prefix also contains '-', so split on the last '_'.
+    """
+    stem = Path(path).stem
+    uuid = stem.rsplit("_", 1)[-1] if "_" in stem else stem
+    return uuid or None
+
+
+def find_omp_session_uuid(pid: int) -> str | None:
+    """Read the session UUID from the .jsonl transcript omp holds open.
+
+    Same trick as pi (which holds a .sqlite open). Preferred over parsing
+    `--resume=` out of argv, because a session started fresh has no such
+    flag but still has the open handle.
+    """
+    prefix = str(OMP_SESSIONS_DIR) + "/"
+    for path in get_open_file_paths(pid):
+        if path.startswith(prefix) and path.endswith(".jsonl"):
+            return _uuid_from_omp_session_path(path)
+    return None
+
+
+def extract_omp_args(command: str) -> str:
+    """Extract the omp flags that are safe to replay on resume."""
+    return extract_agent_args("omp", command)
+
+
+def find_omp_in_pane(pane: PaneInfo) -> AgentInstance | None:
+    """Find an omp agent running as the pane process or a direct child.
+
+    Unlike pi, omp does not rewrite argv[0], so its launch flags survive in
+    the process listing and value-less ones can be replayed on restore.
+    """
+    for pid in pane_process_candidates(pane.pane_pid):
+        cmd = get_process_command(pid)
+        if not cmd or not _is_omp_process(cmd):
+            continue
+        return AgentInstance(
+            pane=pane,
+            agent_type="omp",
+            agent_pid=pid,
+            agent_command=cmd,
+            session_uuid=find_omp_session_uuid(pid),
+            cwd=get_process_cwd(pid),
+            args=extract_omp_args(cmd),
+        )
+    return None
+
 
 # ── Unified discovery ─────────────────────────────────────────────────────────
 
@@ -459,8 +550,48 @@ def discover_all(panes: list[PaneInfo]) -> list[AgentInstance]:
         inst = find_pi_in_pane(pane)
         if inst:
             instances.append(inst)
+            continue
+
+        # Try omp (oh-my-pi). Distinct from pi: different binary, different
+        # session store, different resume flag.
+        inst = find_omp_in_pane(pane)
+        if inst:
+            instances.append(inst)
 
     return instances
+
+
+# ── State schema ──────────────────────────────────────────────────────────────
+#
+# A saved window holds an ordered list of panes:
+#
+#   {"name": "prime", "panes": [ {agent_type, session_uuid, cwd, args}, ... ]}
+#
+# Saves written before split-pane support put those agent fields directly on
+# the window and had no "panes" key, so one tmux window holding two agents was
+# recorded as two same-named windows and restored as two separate windows.
+# Readers go through window_panes() and handle both shapes; nothing needs
+# migrating on disk.
+
+
+def window_panes(win: dict) -> list[dict]:
+    """Panes of a saved window, oldest schema included.
+
+    Legacy windows (no "panes" key) describe a single agent inline, so the
+    window dict is itself the one and only pane.
+    """
+    panes = win.get("panes")
+    if panes is None:
+        return [win]
+    return panes
+
+
+def iter_saved_panes(state: dict):
+    """Yield (session_name, window_dict, pane_dict) across the whole state."""
+    for session in state.get("sessions", []):
+        for win in session.get("windows", []):
+            for pane in window_panes(win):
+                yield session.get("name", "?"), win, pane
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
@@ -496,14 +627,30 @@ def cmd_save(console: Console, dry: bool = False):
     }
 
     for session_name, session_instances in sessions_map.items():
-        windows = []
+        # Group agents by the window they actually live in, keyed on window
+        # INDEX rather than name: names repeat freely (five windows called
+        # 'node' is normal), and two agents sharing a name are a different
+        # thing from two agents sharing a window. Ordering panes by pane_index
+        # keeps the saved layout in the same left-to-right order tmux shows.
+        by_window: dict[int, list[AgentInstance]] = {}
         for inst in session_instances:
+            by_window.setdefault(inst.pane.window_index, []).append(inst)
+
+        windows = []
+        for window_index in sorted(by_window):
+            pane_instances = sorted(by_window[window_index],
+                                    key=lambda i: i.pane.pane_index)
             windows.append({
-                "name": inst.pane.window_name,
-                "cwd": inst.cwd,
-                "agent_type": inst.agent_type,
-                "session_uuid": inst.session_uuid,
-                "args": inst.args,
+                "name": pane_instances[0].pane.window_name,
+                "panes": [
+                    {
+                        "cwd": inst.cwd,
+                        "agent_type": inst.agent_type,
+                        "session_uuid": inst.session_uuid,
+                        "args": inst.args,
+                    }
+                    for inst in pane_instances
+                ],
             })
         state["sessions"].append({
             "name": session_name,
@@ -527,14 +674,18 @@ def cmd_save(console: Console, dry: bool = False):
 
     for session in state["sessions"]:
         for win in session["windows"]:
-            table.add_row(
-                session["name"],
-                win["name"],
-                win["agent_type"],
-                win["cwd"] or "-",
-                win["session_uuid"] or "-",
-                win["args"] or "-",
-            )
+            panes = window_panes(win)
+            for idx, pane in enumerate(panes):
+                # Only annotate a pane index where there is a split to explain.
+                label = win["name"] if len(panes) == 1 else f'{win["name"]} .{idx}'
+                table.add_row(
+                    session["name"],
+                    label,
+                    pane["agent_type"],
+                    pane["cwd"] or "-",
+                    pane["session_uuid"] or "-",
+                    pane["args"] or "-",
+                )
 
     console.print(table)
     if dry:
@@ -654,26 +805,38 @@ def _same_folder(saved_cwd: str | None, target: Path) -> bool:
 
 
 def select_windows_for_folder(state: dict, folder: Path) -> tuple[list[dict], int]:
-    """Pick saved windows whose cwd is `folder`, in state-file order.
+    """Saved windows with at least one pane whose cwd is `folder`.
 
-    Returns (matches, skipped_without_cwd). Each match is the saved window
-    dict plus `_origin_session` — the tmux session it was saved under, kept
-    for display only: folder restore always targets the current session.
+    Returns (window_plans, skipped_without_cwd). Each plan keeps the window's
+    name and only the panes that matched, so a split window whose two agents
+    both live in this folder restores as a split, while a window that merely
+    happens to share a name does not drag in a neighbour's pane.
 
-    Windows saved with cwd=None can't be attributed to any folder (the agent
-    was detected but its cwd couldn't be read). They're counted so we can
-    tell the operator they exist rather than dropping them silently.
+    `_origin_session` records the tmux session the window was saved under. It
+    is display-only: folder restore always targets the current session.
+
+    Panes saved with cwd=None cannot be attributed to any folder (the agent
+    was detected but its cwd was unreadable). They are counted so we can say
+    they exist rather than dropping them silently.
     """
-    matches: list[dict] = []
+    plans: list[dict] = []
     skipped_without_cwd = 0
     for session in state.get("sessions", []):
         for win in session.get("windows", []):
-            if not win.get("cwd"):
-                skipped_without_cwd += 1
-                continue
-            if _same_folder(win.get("cwd"), folder):
-                matches.append({**win, "_origin_session": session.get("name", "?")})
-    return matches, skipped_without_cwd
+            matched = []
+            for pane in window_panes(win):
+                if not pane.get("cwd"):
+                    skipped_without_cwd += 1
+                    continue
+                if _same_folder(pane.get("cwd"), folder):
+                    matched.append(pane)
+            if matched:
+                plans.append({
+                    "name": win["name"],
+                    "panes": matched,
+                    "_origin_session": session.get("name", "?"),
+                })
+    return plans, skipped_without_cwd
 
 
 def summarize_saved_folders(state: dict, limit: int = 5) -> list[tuple[str, int]]:
@@ -683,11 +846,10 @@ def summarize_saved_folders(state: dict, limit: int = 5) -> list[tuple[str, int]
     just sees 'nothing to do' while the state file is full of other projects.
     """
     counts: dict[str, int] = {}
-    for session in state.get("sessions", []):
-        for win in session.get("windows", []):
-            cwd = win.get("cwd")
-            if cwd:
-                counts[cwd] = counts.get(cwd, 0) + 1
+    for _session_name, _win, pane in iter_saved_panes(state):
+        cwd = pane.get("cwd")
+        if cwd:
+            counts[cwd] = counts.get(cwd, 0) + 1
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
 
 
@@ -707,6 +869,11 @@ def is_session_alive(agent_type: str, uuid: str) -> bool:
     if agent_type == "claude":
         # ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
         return bool(list(CLAUDE_PROJECTS_DIR.glob(f"*/{uuid}.jsonl"))) if CLAUDE_PROJECTS_DIR.exists() else False
+    if agent_type == "omp":
+        # ~/.omp/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl
+        if not OMP_SESSIONS_DIR.exists():
+            return False
+        return any(f.is_file() for f in OMP_SESSIONS_DIR.glob(f"*/*{uuid}*.jsonl"))
     if agent_type == "pi":
         # ~/.pi/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl
         # Search the encoded-cwd dirs for any file whose stem ends with the uuid.
@@ -740,23 +907,34 @@ def _settle_new_pane() -> None:
 
 
 def build_resume_command(win: dict) -> str:
-    """Build the shell command to resume an agent in a pane."""
+    """Build the shell command to resume an agent in a pane.
+
+    `win` is a saved pane dict (agent_type / session_uuid / args / cwd);
+    legacy flat windows carry the same keys, so both schemas work.
+    """
     agent_type = win.get("agent_type", "copilot")
     uuid = win.get("session_uuid")
     args = win.get("args", "")
     cwd = win.get("cwd")
 
+    # How each agent is told which session to resume. omp takes
+    # --resume=<id prefix | path> (its bare picker form is interactive), and pi
+    # uses --session because --resume there is also an interactive picker.
     if agent_type == "claude":
-        binary = "claude"
-        resume_cmd = f"{binary} {args} --resume {uuid}".strip() if uuid else f"{binary} {args}".strip()
+        binary, resume_flag = "claude", "--resume {uuid}"
+    elif agent_type == "omp":
+        binary, resume_flag = "omp", "--resume={uuid}"
     elif agent_type == "pi":
-        binary = "pi"
-        # pi uses --session <uuid|partial-uuid> for non-interactive resume.
-        # --resume on pi is an interactive picker, so we deliberately avoid it.
-        resume_cmd = f"{binary} {args} --session {uuid}".strip() if uuid else f"{binary} {args}".strip()
+        binary, resume_flag = "pi", "--session {uuid}"
     else:
-        binary = "copilot"
-        resume_cmd = f"{binary} {args} --resume {uuid}".strip() if uuid else f"{binary} {args}".strip()
+        binary, resume_flag = "copilot", "--resume {uuid}"
+
+    # Join non-empty parts so an agent with no saved flags does not produce a
+    # doubled space (`pi  --session <uuid>`).
+    parts = [binary, args.strip()]
+    if uuid:
+        parts.append(resume_flag.format(uuid=uuid))
+    resume_cmd = " ".join(part for part in parts if part)
 
     if cwd:
         return f"cd {_shell_quote(cwd)} && {resume_cmd}"
@@ -816,17 +994,16 @@ def _stale_note(uuid: str) -> str:
     return f"uuid stale ({uuid[:8]}…), agent not resumed"
 
 
-def _restore_into_existing_pane(report: RestoreReport, session_name: str, win: dict,
-                                pane_pid: int, dry: bool) -> None:
+def _restore_into_existing_pane(report: RestoreReport, session_name: str,
+                                win_name: str, pane: dict, pane_pid: int,
+                                dry: bool) -> None:
     """Resume an agent in a pane that already exists.
 
     Shared by folder-scoped and whole-machine restore so the ladder below
-    (already-running / stale-uuid / no-uuid / resume) has exactly one
-    implementation.
+    (already-running / stale-uuid / no-uuid / resume) has one implementation.
     """
-    win_name = win["name"]
-    agent_type = win.get("agent_type", "copilot")
-    uuid = win.get("session_uuid")
+    agent_type = pane.get("agent_type", "copilot")
+    uuid = pane.get("session_uuid")
 
     if pane_has_agent(pane_pid, agent_type):
         report.add(session_name, win_name, agent_type,
@@ -843,7 +1020,7 @@ def _restore_into_existing_pane(report: RestoreReport, session_name: str, win: d
                    "window exists but no UUID to resume", "WARN")
         return
 
-    resume_cmd = build_resume_command(win)
+    resume_cmd = build_resume_command(pane)
     if dry:
         report.add(session_name, win_name, agent_type,
                    f"would resume {agent_type} in existing window", "DRY", resume_cmd)
@@ -859,79 +1036,147 @@ def _restore_into_existing_pane(report: RestoreReport, session_name: str, win: d
                    f"send-keys failed: {sk.reason}", "FAIL")
 
 
-def _create_window_and_resume(report: RestoreReport, session_name: str, win: dict,
-                              win_cwd: str, existing_windows: list, dry: bool) -> list:
-    """Create a new window in an existing session and resume its agent.
+def _resume_in_new_pane(report: RestoreReport, session_name: str, win_name: str,
+                        pane: dict, pane_pid: int | None, dry: bool,
+                        created: str) -> None:
+    """Report on (and resume into) a pane we just created.
 
-    `existing_windows` is the caller's [(name, pid), ...] snapshot, used to
-    identify which window is the newly created one. Returns a refreshed
-    snapshot so callers can keep claiming against current reality.
+    `created` names what was made, e.g. "created window" or "split pane", and
+    becomes the Action text so the table says what actually happened.
     """
-    win_name = win["name"]
-    agent_type = win.get("agent_type", "copilot")
-    uuid = win.get("session_uuid")
+    agent_type = pane.get("agent_type", "copilot")
+    uuid = pane.get("session_uuid")
+    verb = "would " + created if dry else created
 
     if uuid and not is_session_alive(agent_type, uuid):
-        action = ("would create window; " if dry else "window created; ") + _stale_note(uuid)
-        if dry:
-            report.add(session_name, win_name, agent_type, action, "WARN")
-            return existing_windows
-        nw = run_full(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
-        if not nw.ok:
-            report.add(session_name, win_name, agent_type,
-                       f"new-window failed: {nw.reason}", "FAIL")
-            return existing_windows
-        report.add(session_name, win_name, agent_type, action, "WARN")
-        return get_existing_windows(session_name)
-
+        report.add(session_name, win_name, agent_type,
+                   f"{verb}; {_stale_note(uuid)}", "WARN")
+        return
     if not uuid:
-        if dry:
-            report.add(session_name, win_name, agent_type,
-                       "would create window (no UUID)", "WARN")
-            return existing_windows
-        nw = run_full(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
-        if not nw.ok:
-            report.add(session_name, win_name, agent_type,
-                       f"new-window failed: {nw.reason}", "FAIL")
-            return existing_windows
-        report.add(session_name, win_name, agent_type, "created window (no UUID)", "WARN")
-        return get_existing_windows(session_name)
+        report.add(session_name, win_name, agent_type, f"{verb} (no UUID)", "WARN")
+        return
 
-    resume_cmd = build_resume_command(win)
+    resume_cmd = build_resume_command(pane)
     if dry:
         report.add(session_name, win_name, agent_type,
-                   f"would create window + resume {agent_type}", "DRY", resume_cmd)
-        return existing_windows
-
-    nw = run_full(["tmux", "new-window", "-t", session_name, "-n", win_name, "-c", win_cwd])
-    if not nw.ok:
+                   f"{verb} + resume {agent_type}", "DRY", resume_cmd)
+        return
+    if pane_pid is None:
         report.add(session_name, win_name, agent_type,
-                   f"new-window failed: {nw.reason}", "FAIL")
-        return existing_windows
+                   "new pane not visible after create", "FAIL")
+        return
 
-    # Target the newly created window by finding its pane PID: the one that
-    # wasn't in our previous snapshot.
-    refreshed = get_existing_windows(session_name)
-    old_pids = {pid for _, pid in existing_windows}
-    new_pane_pid = None
-    for name, pid in refreshed:
-        if name == win_name and pid not in old_pids:
-            new_pane_pid = pid
-            break
-
-    if new_pane_pid is None:
+    _settle_new_pane()
+    sk = _send_keys_to_pane(session_name, pane_pid, resume_cmd)
+    if sk.ok:
         report.add(session_name, win_name, agent_type,
-                   "new window not visible after create", "FAIL")
+                   f"{created} + resumed {agent_type}", "OK")
     else:
-        _settle_new_pane()
-        sk = _send_keys_to_pane(session_name, new_pane_pid, resume_cmd)
-        if sk.ok:
-            report.add(session_name, win_name, agent_type,
-                       f"created window + resumed {agent_type}", "OK")
+        report.add(session_name, win_name, agent_type,
+                   f"send-keys failed: {sk.reason}", "FAIL")
+
+
+def _split_for_pane(anchor_pane_pid: int, cwd: str) -> tuple[RunResult, int | None]:
+    """Add a pane to the window holding `anchor_pane_pid`.
+
+    `split-window -P -F '#{pane_pid}'` reports the new pane's pid directly,
+    so there is no need to diff pid sets before and after.
+    """
+    target = _pane_target(anchor_pane_pid)
+    if target is None:
+        return RunResult("", f"no pane with pid {anchor_pane_pid}", 2), None
+    res = run_full(["tmux", "split-window", "-t", target, "-c", cwd,
+                    "-P", "-F", "#{pane_pid}"])
+    if not res.ok:
+        return res, None
+    try:
+        return res, int(res.stdout.strip())
+    except ValueError:
+        return RunResult("", f"unparseable pane pid {res.stdout!r}", 2), None
+
+
+def _restore_window(report: RestoreReport, session_name: str, win: dict,
+                    default_cwd: str, dry: bool,
+                    live_pane_pid: int | None = None,
+                    created_verb: str | None = None) -> None:
+    """Restore every saved pane of one window, splitting as needed.
+
+    Three shapes, selected by the two optional arguments:
+
+      live_pane_pid=None                 the window does not exist; create it
+      live_pane_pid=<pid>                the window exists; align to its panes
+      live_pane_pid=<pid> + created_verb the window was *just* created by the
+                                         caller (tmux new-session makes its
+                                         first window), so pane 0 is fresh
+                                         rather than pre-existing
+
+    Saved panes align to live panes by position; a saved pane with no live
+    counterpart becomes a split.
+    """
+    panes = window_panes(win)
+    if not panes:
+        return
+    win_name = win["name"]
+    first = panes[0]
+
+    if live_pane_pid is None:
+        verb = created_verb or ("create window" if dry else "created window")
+        if dry:
+            _resume_in_new_pane(report, session_name, win_name, first, None,
+                                dry, verb)
+            live = []
         else:
-            report.add(session_name, win_name, agent_type,
-                       f"send-keys failed: {sk.reason}", "FAIL")
-    return refreshed
+            nw = run_full(["tmux", "new-window", "-t", session_name,
+                           "-n", win_name, "-c", first.get("cwd") or default_cwd,
+                           "-P", "-F", "#{pane_pid}"])
+            if not nw.ok:
+                report.add(session_name, win_name,
+                           first.get("agent_type", "copilot"),
+                           f"new-window failed: {nw.reason}", "FAIL")
+                return
+            try:
+                live = [int(nw.stdout.strip())]
+            except ValueError:
+                report.add(session_name, win_name,
+                           first.get("agent_type", "copilot"),
+                           "new window not visible after create", "FAIL")
+                return
+            _resume_in_new_pane(report, session_name, win_name, first, live[0],
+                                dry, verb)
+        panes, consumed = panes[1:], 1
+    else:
+        live = [pid for _idx, pid in get_window_panes_of(live_pane_pid)]
+        if created_verb:
+            _resume_in_new_pane(report, session_name, win_name, first,
+                                live[0] if live else None, dry, created_verb)
+            panes, consumed = panes[1:], 1
+        else:
+            consumed = 0
+
+    for i, pane in enumerate(panes):
+        live_idx = i + consumed
+        if live_idx < len(live):
+            _restore_into_existing_pane(report, session_name, win_name, pane,
+                                        live[live_idx], dry)
+            continue
+
+        # No live pane at this position - the window needs a new split.
+        if dry:
+            _resume_in_new_pane(report, session_name, win_name, pane, None, dry,
+                                "split pane")
+            continue
+        if not live:
+            report.add(session_name, win_name, pane.get("agent_type", "copilot"),
+                       "no pane to split from", "FAIL")
+            continue
+        res, new_pid = _split_for_pane(live[-1], pane.get("cwd") or default_cwd)
+        if not res.ok or new_pid is None:
+            report.add(session_name, win_name, pane.get("agent_type", "copilot"),
+                       f"split-window failed: {res.reason}", "FAIL")
+            continue
+        live.append(new_pid)
+        _resume_in_new_pane(report, session_name, win_name, pane, new_pid, dry,
+                            "split pane")
 
 
 def cmd_restore(console: Console, dry: bool = False) -> int:
@@ -971,71 +1216,42 @@ def cmd_restore(console: Console, dry: bool = False) -> int:
         if not windows:
             continue
 
-        first_cwd = windows[0].get("cwd") or os.path.expanduser("~")
+        first_panes = window_panes(windows[0])
+        default_cwd = (first_panes[0].get("cwd") if first_panes else None) \
+            or os.path.expanduser("~")
 
-        # Ensure session exists
+        # Ensure the session exists. tmux new-session also makes the first
+        # window, so that window is handed to _restore_window as already-created.
         if session_name not in existing_sessions:
             first_win = windows[0]
-            win_cwd = first_win.get("cwd") or first_cwd
-            agent_type = first_win.get("agent_type", "copilot")
-            uuid = first_win.get("session_uuid")
-
             if dry:
-                # Preview only: no session is created, so there is no pane to
-                # resolve. Report the intent, then preview the rest of this
-                # session's windows as new-window creations.
-                if uuid and not is_session_alive(agent_type, uuid):
-                    report.add(session_name, first_win["name"], agent_type,
-                               "would create session + window; " + _stale_note(uuid), "WARN")
-                elif uuid:
-                    report.add(session_name, first_win["name"], agent_type,
-                               "would create session + window + resume", "DRY",
-                               build_resume_command(first_win))
-                else:
-                    report.add(session_name, first_win["name"], agent_type,
-                               "would create session + window (no UUID)", "WARN")
-                existing_sessions.add(session_name)
-                for win in windows[1:]:
-                    _create_window_and_resume(
-                        report, session_name, win,
-                        win.get("cwd") or first_cwd, [], dry=True)
-                continue
-
-            new_sess = run_full(["tmux", "new-session", "-d", "-s", session_name,
-                                  "-n", first_win["name"], "-c", win_cwd])
-            if not new_sess.ok:
-                report.add(session_name, first_win["name"], agent_type,
-                           f"new-session failed: {new_sess.reason}", "FAIL")
-                # Skip the rest of this tmux session - nothing else will work.
-                continue
-
-            if uuid and not is_session_alive(agent_type, uuid):
-                report.add(session_name, first_win["name"], agent_type,
-                           "window created; " + _stale_note(uuid), "WARN")
-            elif uuid:
-                resume_cmd = build_resume_command(first_win)
-                # Look up the freshly-created pane by PID so we can send-keys
-                # via an unambiguous `<session>:<window_idx>.<pane_idx>` target.
-                # Name-based targeting (`<session>:<window_name>`) breaks when
-                # the window name contains a '.' - tmux mis-parses it as a
-                # window/pane index expression (see FX001-3).
-                fresh = get_existing_windows(session_name)
-                first_pid = next((pid for n, pid in fresh if n == first_win["name"]), None)
-                if first_pid is None:
-                    report.add(session_name, first_win["name"], agent_type,
-                               "new window not visible after create", "FAIL")
-                else:
-                    _settle_new_pane()
-                    sk = _send_keys_to_pane(session_name, first_pid, resume_cmd)
-                    if sk.ok:
-                        report.add(session_name, first_win["name"], agent_type,
-                                   "created session + window + resumed", "OK")
-                    else:
-                        report.add(session_name, first_win["name"], agent_type,
-                                   f"send-keys failed: {sk.reason}", "FAIL")
+                _restore_window(report, session_name, first_win, default_cwd, dry,
+                                created_verb="create session + window")
             else:
-                report.add(session_name, first_win["name"], agent_type,
-                           "created session + window (no UUID)", "WARN")
+                new_sess = run_full([
+                    "tmux", "new-session", "-d", "-s", session_name,
+                    "-n", first_win["name"],
+                    "-c", (first_panes[0].get("cwd") if first_panes else None) or default_cwd,
+                    "-P", "-F", "#{pane_pid}"])
+                if not new_sess.ok:
+                    report.add(session_name, first_win["name"],
+                               (first_panes[0].get("agent_type", "copilot")
+                                if first_panes else "copilot"),
+                               f"new-session failed: {new_sess.reason}", "FAIL")
+                    # Skip the rest of this tmux session - nothing else will work.
+                    continue
+                try:
+                    first_pid = int(new_sess.stdout.strip())
+                except ValueError:
+                    report.add(session_name, first_win["name"],
+                               (first_panes[0].get("agent_type", "copilot")
+                                if first_panes else "copilot"),
+                               "new window not visible after create", "FAIL")
+                    continue
+                _settle_new_pane()
+                _restore_window(report, session_name, first_win, default_cwd, dry,
+                                live_pane_pid=first_pid,
+                                created_verb="created session + window")
 
             existing_sessions.add(session_name)
             remaining_windows = windows[1:]
@@ -1048,7 +1264,6 @@ def cmd_restore(console: Console, dry: bool = False) -> int:
 
         for win in remaining_windows:
             win_name = win["name"]
-            win_cwd = win.get("cwd") or first_cwd
 
             # Find an unclaimed existing window with this name
             matched_idx = None
@@ -1061,12 +1276,13 @@ def cmd_restore(console: Console, dry: bool = False) -> int:
 
             if matched_idx is not None:
                 claimed.add(matched_idx)
-                _restore_into_existing_pane(report, session_name, win,
-                                            matched_pane_pid, dry)
+                _restore_window(report, session_name, win, default_cwd, dry,
+                                live_pane_pid=matched_pane_pid)
             else:
                 # No unclaimed window with this name - create a new one
-                existing_windows = _create_window_and_resume(
-                    report, session_name, win, win_cwd, existing_windows, dry)
+                _restore_window(report, session_name, win, default_cwd, dry)
+                if not dry:
+                    existing_windows = get_existing_windows(session_name)
 
     _print_report(console, report, dry)
     return 0
@@ -1151,8 +1367,6 @@ def cmd_restore_folder(console: Console, dry: bool = False) -> int:
     # Claims are tracked by pane PID, not list index: creating a window
     # re-orders the live list, and PIDs stay stable across refreshes.
     claimed_pids: set[int] = set()
-    # [(name, pid), ...] view for the create path's new-window detection.
-    existing_windows = [(name, pid) for name, pid, _ in live]
 
     for win in matches:
         win_name = win["name"]
@@ -1167,24 +1381,68 @@ def cmd_restore_folder(console: Console, dry: bool = False) -> int:
             matched_pane_pid = pane_pid
             break
 
-        if matched_pane_pid is not None:
-            _restore_into_existing_pane(report, session_name, win,
-                                        matched_pane_pid, dry)
-        else:
-            before_pids = {pid for _, pid in existing_windows}
-            existing_windows = _create_window_and_resume(
-                report, session_name, win, str(folder), existing_windows, dry)
-            if not dry and target_session:
-                # Claim whatever pane we just created, and refresh the
-                # path-aware view so a later window cannot re-claim it.
-                claimed_pids |= {pid for _, pid in existing_windows} - before_pids
-                live = get_existing_windows_with_path(target_session)
+        _restore_window(report, session_name, win, str(folder), dry,
+                        live_pane_pid=matched_pane_pid)
+
+        if not dry and target_session:
+            # Refresh the path-aware view so panes created just now are visible
+            # and cannot be re-claimed by a later window.
+            before = {pid for _n, pid, _p in live}
+            live = get_existing_windows_with_path(target_session)
+            claimed_pids |= {pid for _n, pid, _p in live} - before
 
     _print_report(console, report, dry)
     if skipped_without_cwd:
         console.print(f"[dim]note: {skipped_without_cwd} saved window(s) have no recorded "
                       "cwd and can't be folder-matched; use --all to restore them.[/dim]")
     return 0
+
+
+def _pane_target(pane_pid: int) -> str | None:
+    """Resolve a pane PID to an unambiguous `<session>:<win_idx>.<pane_idx>`.
+
+    Name-based targeting breaks when a window name contains a '.' — tmux
+    mis-parses it as a window/pane index expression (FX001-3) — so every
+    mutation routes through a pid lookup instead.
+    """
+    # `list-panes -a` lists every pane across every session; `-t` is ignored
+    # alongside `-a`, so we drop it (cosmetic cleanup vs the original code).
+    raw = run([
+        "tmux", "list-panes", "-a",
+        "-F", "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}"
+    ])
+    for line in (raw or "").splitlines():
+        parts = line.split("|", 1)
+        if len(parts) == 2 and parts[1].strip() == str(pane_pid):
+            return parts[0]
+    return None
+
+
+def get_window_panes_of(pane_pid: int) -> list[tuple[int, int]]:
+    """[(pane_index, pane_pid), ...] for the window containing `pane_pid`.
+
+    Ordered by pane index, which is the order saved panes align against.
+    """
+    raw = run([
+        "tmux", "list-panes", "-a",
+        "-F", "#{session_name}:#{window_index}|#{pane_index}|#{pane_pid}"
+    ])
+    rows = []
+    owner = None
+    for line in (raw or "").splitlines():
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        try:
+            rows.append((parts[0], int(parts[1]), int(parts[2])))
+        except ValueError:
+            continue
+        if rows[-1][2] == pane_pid:
+            owner = parts[0]
+    if owner is None:
+        return []
+    return sorted(((idx, pid) for win, idx, pid in rows if win == owner),
+                  key=lambda r: r[0])
 
 
 def _send_keys_to_pane(session_name: str, pane_pid: int, keys: str) -> RunResult:
@@ -1194,18 +1452,7 @@ def _send_keys_to_pane(session_name: str, pane_pid: int, keys: str) -> RunResult
     On lookup failure (no pane with that PID), returns a synthetic non-zero
     RunResult — we never silently fall back to name-based targeting (FX001-3).
     """
-    # `list-panes -a` lists every pane across every session; `-t` is ignored
-    # alongside `-a`, so we drop it (cosmetic cleanup vs the original code).
-    raw = run([
-        "tmux", "list-panes", "-a",
-        "-F", "#{session_name}:#{window_index}.#{pane_index}|#{pane_pid}"
-    ])
-    target = None
-    for line in (raw or "").splitlines():
-        parts = line.split("|", 1)
-        if len(parts) == 2 and parts[1].strip() == str(pane_pid):
-            target = parts[0]
-            break
+    target = _pane_target(pane_pid)
     if not target:
         return RunResult(
             stdout="",

@@ -1,6 +1,6 @@
 # comax
 
-Save and restore tmux sessions running Copilot CLI, Claude Code, and pi.
+Save and restore tmux sessions running Copilot CLI, Claude Code, pi, and omp (oh-my-pi).
 
 If your machine restarts, tmux crashes, or you accidentally kill a pane — `comax` gets you back to exactly where you were. It discovers all running Copilot CLI, Claude Code, and pi instances across your tmux sessions, saves their state, and can rehydrate everything with a single command.
 
@@ -11,6 +11,11 @@ If your machine restarts, tmux crashes, or you accidentally kill a pane — `com
 - **Copilot CLI**: walks each pane's process tree, matches PIDs to `~/.copilot/session-state/*/inuse.<PID>.lock` files
 - **Claude Code**: matches child PIDs to `~/.claude/sessions/<PID>.json` files
 - **pi**: matches direct-child PIDs named `pi`, then uses `lsof` to read the open `~/.pi/db/session-sql/<uuid>.sqlite` handle for the session UUID and the process cwd
+- **omp** (oh-my-pi): matches `omp` as argv[0] or behind its `bun` wrapper, then reads the open `~/.omp/agent/sessions/<cwd>/<ts>_<uuid>.jsonl` handle for the session UUID
+
+Agents are matched against the pane's own process as well as its children, so an
+agent exec'd directly as the pane command — with no shell in between — is still
+found. Split panes are discovered and restored individually.
 
 All three are saved to `~/.config/comax/state.json` with session UUIDs, working directories, and CLI flags.
 
@@ -18,7 +23,7 @@ All three are saved to `~/.config/comax/state.json` with session UUIDs, working 
 
 > **Note on launch flags**: only value-less switches that are safe to replay are
 > carried across a restore — `--yolo` for copilot, `--dangerously-skip-permissions`
-> for claude. Options that take a value (`--model`, `--effort`, `--context`) are not
+> for claude, `--auto-approve` for omp. Options that take a value (`--model`, `--effort`, `--context`) are not
 > restored, so an agent comes back on its default configuration. Session-selecting
 > flags (`--session-id`, `--continue`) are deliberately dropped too, since the saved
 > UUID already supplies the session via `--resume`; carrying them would produce a
@@ -32,7 +37,9 @@ All three are saved to `~/.config/comax/state.json` with session UUIDs, working 
 - Everything already running → skips (no-op)
 - Saved session UUID no longer on disk → warns instead of leaving a broken pane
 
-Each agent is resumed with the correct command (`copilot --yolo --resume <uuid>`, `claude --resume <uuid>`, or `pi --session <uuid>`) from the right working directory.
+- Window had a split → the extra panes are recreated with `tmux split-window`
+
+Each agent is resumed with the correct command (`copilot --yolo --resume <uuid>`, `claude --resume <uuid>`, `pi --session <uuid>`, or `omp --resume=<uuid>`) from the right working directory.
 
 ## Prerequisites
 
@@ -52,8 +59,13 @@ This puts `comax` on your PATH so you can run it from anywhere.
 To update to the latest version:
 
 ```bash
-uv tool install git+https://github.com/jakkaj/comax.git --force
+uv tool install git+https://github.com/jakkaj/comax.git --force --reinstall
 ```
+
+> `--force` on its own can reinstall a **cached build** when the version string
+> hasn't changed — it reports success while leaving the old code in place. Add
+> `--reinstall` (and `--no-cache` when installing from a local checkout) so you
+> actually get the new build.
 
 Or run it once without installing:
 
