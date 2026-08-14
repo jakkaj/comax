@@ -1,0 +1,19 @@
+src/comax/cli.py
+  s_f3f81f4d4c969b::t_c91e179fb9ccdd 180-183,186-188,190-193,195-204,209-218,220-221
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "63db0fccfde6f8817f714efbcbe895c4ec1ce3df",
+  "prompts": {},
+  "sessions": {
+    "s_f3f81f4d4c969b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "700bba97-83d6-43a5-9625-9e44e5cd41be",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Jordan Knight <jakkaj@gmail.com>"
+    }
+  }
+}
