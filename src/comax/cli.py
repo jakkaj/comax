@@ -177,26 +177,48 @@ def get_process_command(pid: int) -> str:
 #   bun  /path/to/omp --auto-approve
 _WRAPPER_BINARIES = ("node", "bun", "bunx", "npx", "deno")
 
+# Subcommands a wrapper may take before the script name: `bun run omp`,
+# `npx exec copilot`. Skipped so the real binary is still found at argv[2].
+_WRAPPER_SUBCOMMANDS = ("run", "x", "exec")
+
 
 def _is_agent_binary(cmd: str, name: str) -> bool:
-    """True iff argv[0] (or argv[1] behind a wrapper) is the named binary.
+    """True iff the command line launches the named agent binary.
 
-    Matches `name ...`, `/abs/path/to/name ...`, and `node /abs/path/name ...`.
+    Matches, in order of how they show up in `ps -o command=`:
 
-    Rejects anything where the name merely appears as a substring of an
-    argument (e.g. `lean-ctx -c 'build_copilot_lock_index'`, `gh copilot ...`,
-    `grep copilot`). Restricting to argv[0]/argv[1] basenames removes those
-    false positives without losing the real npm-wrapper detection.
+        name ...                        launched from PATH
+        /abs/path/to/name ...           launched by absolute path
+        node /abs/path/to/name ...      npm shim, or a #! script
+        bun run /abs/path/to/name ...   wrapper with a subcommand
+
+    The middle two are how agents usually appear: omp is a `#!/usr/bin/env bun`
+    script, so the kernel execs it as `bun /path/to/omp ...` — which is why
+    `ps comm=` says 'bun' and tmux says 'bun.exe' while the full argv still
+    names omp. Detection reads the full argv precisely so those short display
+    names never matter.
+
+    Only argv[0], argv[1] (and argv[2] behind a wrapper subcommand) are
+    considered. Scanning every token would re-open the false-positive class
+    FX001-2 closed — `node /path/script.js --config omp` must not count as omp,
+    any more than `grep copilot` counts as copilot.
     """
     toks = cmd.split()
     if not toks:
         return False
-    argv0 = toks[0].split("/")[-1].lower()
-    if argv0 == name:
+
+    def basename(tok: str) -> str:
+        return tok.split("/")[-1].lower()
+
+    if basename(toks[0]) == name:
         return True
-    # Strip a .exe suffix: tmux reports bun as 'bun.exe' in pane_current_command.
-    if argv0.removesuffix(".exe") in _WRAPPER_BINARIES and len(toks) >= 2:
-        return toks[1].split("/")[-1].lower() == name
+    # Strip .exe: bun reports itself as 'bun.exe' in some listings.
+    if basename(toks[0]).removesuffix(".exe") not in _WRAPPER_BINARIES:
+        return False
+    if len(toks) >= 2 and basename(toks[1]) == name:
+        return True
+    if len(toks) >= 3 and toks[1].lower() in _WRAPPER_SUBCOMMANDS:
+        return basename(toks[2]) == name
     return False
 
 
