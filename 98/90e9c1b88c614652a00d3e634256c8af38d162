@@ -1,0 +1,14 @@
+src/comax/cli.py
+  h_9e71e8b09f7cf2 1,20-21,29,68,70,556,721-728
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.21",
+  "base_commit_sha": "9890e9c1b88c614652a00d3e634256c8af38d162",
+  "prompts": {},
+  "humans": {
+    "h_9e71e8b09f7cf2": {
+      "author": "Jordan Knight <jakkaj@gmail.com>"
+    }
+  }
+}
