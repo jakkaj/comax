@@ -1,4 +1,4 @@
-"""comax: Save and restore tmux + Copilot CLI, Claude Code, and pi sessions.
+"""comax: Save and restore tmux + Copilot CLI, Claude Code, pi, and omp sessions.
 
 Usage:
   comax                        # Scan the whole machine, display, and save state
@@ -17,6 +17,8 @@ Discovery:
   Copilot: process tree walk -> PID match against ~/.copilot/session-state/*/inuse.<PID>.lock
   Claude:  child PID match against ~/.claude/sessions/<PID>.json
   pi:      child PID with basename 'pi' -> lsof for cwd and open session-sql/<uuid>.sqlite
+  omp:     'omp' as argv[0] or behind its bun wrapper -> lsof for the open
+           ~/.omp/agent/sessions/<cwd>/<ts>_<uuid>.jsonl transcript
 """
 
 import argparse
@@ -24,6 +26,7 @@ import json
 import os
 import subprocess
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from glob import glob
 from pathlib import Path
@@ -62,9 +65,9 @@ class PaneInfo:
 
 @dataclass
 class AgentInstance:
-    """A CLI agent (copilot, claude, or pi) running in a tmux pane."""
+    """A CLI agent (copilot, claude, pi, or omp) running in a tmux pane."""
     pane: PaneInfo
-    agent_type: str  # "copilot", "claude", or "pi"
+    agent_type: str  # "copilot", "claude", "pi", or "omp"
     agent_pid: int
     agent_command: str
     session_uuid: str | None = None
@@ -550,7 +553,7 @@ def find_omp_in_pane(pane: PaneInfo) -> AgentInstance | None:
 
 
 def discover_all(panes: list[PaneInfo]) -> list[AgentInstance]:
-    """Find all copilot and claude instances across tmux panes."""
+    """Find all copilot, claude, pi, and omp instances across tmux panes."""
     copilot_lock_index = build_copilot_lock_index()
     claude_session_index = build_claude_session_index()
 
@@ -715,16 +718,14 @@ def cmd_save(console: Console, dry: bool = False):
     else:
         console.print(f"\n[green]State saved to {STATE_FILE}[/green]")
 
-    copilot_count = sum(1 for inst in instances if inst.agent_type == "copilot")
-    claude_count = sum(1 for inst in instances if inst.agent_type == "claude")
-    pi_count = sum(1 for inst in instances if inst.agent_type == "pi")
-    parts = []
-    if copilot_count:
-        parts.append(f"{copilot_count} copilot")
-    if claude_count:
-        parts.append(f"{claude_count} claude")
-    if pi_count:
-        parts.append(f"{pi_count} pi")
+    # Count every discovered agent type, not a hand-written subset: omp was
+    # detected and tabled but silently missing from this line, which read as
+    # "comax doesn't support omp". RESTORE_SAFE_FLAGS is the registry of known
+    # agents, so it fixes display order; anything newer sorts after it.
+    counts = Counter(inst.agent_type for inst in instances)
+    order = list(RESTORE_SAFE_FLAGS)
+    known = sorted(counts, key=lambda t: (order.index(t) if t in order else len(order), t))
+    parts = [f"{counts[t]} {t}" for t in known]
     console.print(f"[dim]{' + '.join(parts)} instance(s) across {len(sessions_map)} session(s)[/dim]")
 
 
